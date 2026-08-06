@@ -1,404 +1,413 @@
-#======STEP 1: LOAD MODULES=====#
+# AI Personal Budget Planner
+# Mini Project - Python + Streamlit + Gemini API (via LangChain)
+# made this to track monthly budget and get AI tips
+
 import os
-import smtplib
 import urllib.parse
+
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.messages import HumanMessage, AIMessage
 
-st.set_page_config(page_title = "AI Personal Budget Planner", layout = "wide")
+load_dotenv()
+
+DATA_FILE = "data.csv"
+cols = ["Category", "Remark", "Amount"]  # columns for the expense table
+
+st.set_page_config(page_title="AI Personal Budget Planner", layout="wide", page_icon="💰")
+
+# little bit of css just to make metric boxes look nice, took this from streamlit forum
+st.markdown("""
+<style>
+.stMetric {background-color:#F5F7FA; padding:10px; border-radius:10px;}
+</style>
+""", unsafe_allow_html=True)
+
 st.title("AI Personal Budget Planner 💰")
-st.header("""Track your income, expenses, and get AI powered budget advice""")
+st.write("Track your income, expenses, and get AI powered budget advice")
 
-#===============STEP 2: LOAD API-KEY==============
+# ---------------- API KEY (sidebar) ----------------
 st.sidebar.title("Give API KEY")
-GEMINI_API_KEY = st.sidebar.text_input("GEMINI_API_KEY", type = "password")
+env_key = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = st.sidebar.text_input("GEMINI_API_KEY", type="password", value=env_key if env_key else "")
 
 if GEMINI_API_KEY:
     st.sidebar.success("API key Loaded!!")
 else:
     st.sidebar.info("Give API key")
-    url = "https://aistudio.google.com/app/apikey"
-    st.sidebar.markdown(f"Get Gemini API Key-{url}")
+    st.sidebar.markdown("Get key from https://aistudio.google.com/app/apikey")
 
-#=========================STEP 3: SESSION STATE========================#
-# session_state is used so streamlit does not forget our expense table,
-# chat history, and savings goal on every rerun
+
+# small helper so we don't repeat the same ChatGoogleGenerativeAI setup everywhere
+def get_gemini_model():
+    return ChatGoogleGenerativeAI(
+        model="gemini-3.5-flash-lite",
+        google_api_key=GEMINI_API_KEY,
+        temperature=0.7
+    )
+
+
+# loads expense data from csv, if file not there just make empty table
+def load_expenses():
+    try:
+        df = pd.read_csv(DATA_FILE)
+        if list(df.columns) != cols:
+            df = pd.DataFrame(columns=cols)
+    except:
+        df = pd.DataFrame(columns=cols)
+    df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce").fillna(0.0)
+    return df
+
+
+def save_expenses(df):
+    df.to_csv(DATA_FILE, index=False)
+
+
 if "expenses" not in st.session_state:
-    st.session_state.expenses = pd.DataFrame(columns = ["Category", "Amount", "Remark"])
+    st.session_state.expenses = load_expenses()
 
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-if "goal" not in st.session_state:
-    st.session_state.goal = {"name": "", "amount": 0.0, "months": 0, "type": "Short-term (< 1 year)"}
+if "budgets" not in st.session_state:
+    st.session_state.budgets = {}
 
-#=====================STEP 4: INCOME INPUT======================
-st.subheader("Monthly Income")
-monthly_income = st.number_input("Enter Monthly Income (₹)", min_value = 0.0, step = 500.0)
+# ---------------- INCOME ----------------
+st.subheader("1. Monthly Income")
+income = st.number_input("Enter Monthly Income (₹)", min_value=0.0, step=500.0)
 
-#=====================STEP 5: ADD EXPENSE FORM====================
-st.subheader("Add Expense")
-
-col1, col2, col3, col4 = st.columns([1, 1, 1.4, 0.8])
-
-with col1:
-    category = st.selectbox("Category", ["Food", "Rent", "Transport", "Shopping", "Entertainment", "Utilities", "Other"])
-with col2:
-    amount = st.number_input("Amount (₹)", min_value = 0.0, step = 50.0, key = "amount_input")
-with col3:
-    remark = st.text_input("Custom Name / Remark (optional)", key = "remark_input",
-                            placeholder = "e.g. Netflix, Diwali shopping...")
-with col4:
-    st.write("")
-    st.write("")
-    add_clicked = st.button("➕ Add Expense")
-
-if add_clicked:
-    if amount > 0:
-        # if "Other" is picked and a remark is given, use the remark as the
-        # visible category name so the table shows something meaningful
-        display_category = remark.strip() if (category == "Other" and remark.strip()) else category
-        new_row = pd.DataFrame([{"Category": display_category, "Amount": amount, "Remark": remark.strip()}])
-        st.session_state.expenses = pd.concat([st.session_state.expenses, new_row], ignore_index = True)
-        st.session_state.expenses["Amount"] = pd.to_numeric(st.session_state.expenses["Amount"], errors = "coerce").fillna(0.0)
-        st.success(f"Added {display_category} : ₹{amount}")
-    else:
-        st.warning("Amount should be greater than 0")
-
-#=====================STEP 6: SHOW EXPENSE TABLE====================
-st.subheader("Expense Table")
-
-if st.session_state.expenses.empty:
-    st.info("No expenses added yet")
-else:
-    st.dataframe(st.session_state.expenses, use_container_width = True)
-    if st.button("🗑️ Clear All"):
-        st.session_state.expenses = pd.DataFrame(columns = ["Category", "Amount", "Remark"])
-        st.rerun()
-
-#=====================STEP 7: CALCULATE TOTALS====================
-total_expense = st.session_state.expenses["Amount"].sum() if not st.session_state.expenses.empty else 0.0
-balance = monthly_income - total_expense
-savings = balance
-
-st.subheader("Summary")
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Total Income", f"₹{monthly_income:,.2f}")
-c2.metric("Total Expense", f"₹{total_expense:,.2f}")
-c3.metric("Balance", f"₹{balance:,.2f}")
-c4.metric("Savings", f"₹{savings:,.2f}")
-
-#=====================STEP 8: PIE CHART====================
-st.subheader("Expense Breakdown")
-
-if not st.session_state.expenses.empty:
-    category_totals = st.session_state.expenses.groupby("Category")["Amount"].sum().astype(float)
-    fig, ax = plt.subplots()
-    ax.pie(category_totals.values, labels = category_totals.index, autopct = "%1.1f%%", startangle = 90)
-    ax.axis("equal")
-    st.pyplot(fig)
-else:
-    st.info("Add expenses to see the chart")
-
-#=====================STEP 9: RULE BASED TIPS====================
-st.subheader("Quick Tips")
-
-if monthly_income > 0:
-    savings_rate = (savings / monthly_income) * 100
-
-    if savings_rate < 20:
-        st.warning(f"Your savings are only {savings_rate:.1f}% of income. Try to save at least 20%.")
-    else:
-        st.success(f"Good job! You are saving {savings_rate:.1f}% of your income.")
-
-    if not st.session_state.expenses.empty:
-        food_total = st.session_state.expenses.loc[
-            st.session_state.expenses["Category"].astype(str).str.lower() == "food", "Amount"
-        ].sum()
-        if food_total > 0.15 * monthly_income:
-            st.warning(f"Food expense ₹{food_total:,.2f} is high. Try cooking at home more.")
-
-    if total_expense > monthly_income:
-        st.error("You are spending more than you earn this month!")
-else:
-    st.info("Enter income to see tips")
-
-#=====================STEP 10: SAVINGS GOAL PLANNER====================
-st.subheader("🎯 Savings Goal Planner")
-
-g1, g2, g3, g4 = st.columns(4)
-with g1:
-    goal_name = st.text_input("Goal Name", value = st.session_state.goal["name"], placeholder = "e.g. Emergency Fund")
-with g2:
-    goal_amount = st.number_input("Target Amount (₹)", min_value = 0.0, step = 1000.0, value = st.session_state.goal["amount"])
-with g3:
-    goal_months = st.number_input("Timeframe (months)", min_value = 0, step = 1, value = st.session_state.goal["months"])
-with g4:
-    goal_type = st.selectbox(
-        "Saving Type",
-        ["Short-term (< 1 year)", "Long-term (>= 1 year)"],
-        index = 0 if st.session_state.goal["type"].startswith("Short") else 1
-    )
-
-st.session_state.goal = {"name": goal_name, "amount": goal_amount, "months": goal_months, "type": goal_type}
-
-if goal_amount > 0 and goal_months > 0:
-    required_monthly_saving = goal_amount / goal_months
-    st.write(
-        f"To reach **{goal_name or 'your goal'}** (₹{goal_amount:,.2f}) in {goal_months} months, "
-        f"you need to save **₹{required_monthly_saving:,.2f}/month**."
-    )
-
-    progress = min(max(savings / required_monthly_saving, 0.0), 1.0) if required_monthly_saving > 0 else 0.0
-    st.progress(progress)
-
-    if savings >= required_monthly_saving:
-        st.success("You're on track to hit this goal at your current savings rate! 🎉")
-    else:
-        shortfall = required_monthly_saving - savings
-        st.warning(f"You're short by ₹{shortfall:,.2f}/month to hit this goal on time.")
-else:
-    st.info("Set a goal amount and timeframe to see your plan")
-
-#=====================STEP 11: BUDGET FORECAST====================
-st.subheader("📈 Budget Forecast")
-
-f1, f2, f3, f4 = st.columns(4)
-with f1:
-    forecast_trend_type = st.selectbox("Forecast Trend Type", ["Monthly", "Yearly"])
-with f2:
-    forecast_periods = st.number_input(
-        f"Number of {forecast_trend_type.lower()}s to forecast",
-        min_value = 1, max_value = 60, value = 6, step = 1
-    )
-with f3:
-    income_growth = st.number_input("Expected Income Growth (% per period)", value = 0.0, step = 0.5)
-with f4:
-    expense_growth = st.number_input("Expected Expense Growth (% per period)", value = 0.0, step = 0.5)
-
-if monthly_income > 0:
-    periods = list(range(1, int(forecast_periods) + 1))
-    forecast_income = [monthly_income * ((1 + income_growth / 100) ** p) for p in periods]
-    forecast_expense = [total_expense * ((1 + expense_growth / 100) ** p) for p in periods]
-    forecast_balance = [i - e for i, e in zip(forecast_income, forecast_expense)]
-
-    forecast_df = pd.DataFrame({
-        forecast_trend_type: periods,
-        "Projected Income (₹)": [f"{v:,.2f}" for v in forecast_income],
-        "Projected Expense (₹)": [f"{v:,.2f}" for v in forecast_expense],
-        "Projected Savings (₹)": [f"{v:,.2f}" for v in forecast_balance],
-    })
-    st.dataframe(forecast_df, use_container_width = True)
-
-    fig2, ax2 = plt.subplots()
-    ax2.plot(periods, forecast_income, marker = "o", label = "Income")
-    ax2.plot(periods, forecast_expense, marker = "o", label = "Expense")
-    ax2.plot(periods, forecast_balance, marker = "o", label = "Savings")
-    ax2.set_xlabel(forecast_trend_type)
-    ax2.set_ylabel("Amount (₹)")
-    ax2.set_title(f"{forecast_trend_type} Forecast for the next {forecast_periods} {forecast_trend_type.lower()}(s)")
-    ax2.legend()
-    st.pyplot(fig2)
-
-    cumulative_savings = sum(forecast_balance)
-    st.info(
-        f"Projected cumulative savings over {forecast_periods} {forecast_trend_type.lower()}(s): "
-        f"₹{cumulative_savings:,.2f}"
-    )
-else:
-    st.info("Enter income to see forecast")
-
-#=====================STEP 12: AI FINANCIAL ADVISOR (LangChain + Gemini)====================
-st.subheader("AI Financial Advisor")
-
-def get_ai_advice(income, expense, balance, savings, expense_summary):
-    """This function sends the budget summary
-    to gemini model (via langchain) and returns personalized
-    financial advice based on given data"""
-    prompt = ChatPromptTemplate.from_template(
-        """
-        You are a friendly personal finance advisor.
-        Monthly Income: ₹{income}
-        Total Expense: ₹{expense}
-        Balance: ₹{balance}
-        Savings: ₹{savings}
-        Expense Breakdown:
-        {expense_summary}
-
-        Give me 3-5 short, practical tips to improve my budget and savings.
-        """
-    )
-
-    model = ChatGoogleGenerativeAI(
-        model = "gemini-3.5-flash-lite",
-        google_api_key = GEMINI_API_KEY,
-        temperature = 0.7
-    )
-
-    chain = prompt | model | StrOutputParser()
-
-    response = chain.invoke({
-        "income": income,
-        "expense": expense,
-        "balance": balance,
-        "savings": savings,
-        "expense_summary": expense_summary
-    })
-
-    return response
-
-if st.button("🤖 Get AI Financial Advice"):
-    if not GEMINI_API_KEY:
-        st.error("Give API key first in the sidebar")
-    elif monthly_income == 0:
-        st.warning("Enter monthly income first")
-    else:
-        with st.spinner("Asking Gemini for advice.."):
-            try:
-                expense_summary = st.session_state.expenses.groupby("Category")["Amount"].sum().to_string() if not st.session_state.expenses.empty else "No expenses recorded"
-                advice = get_ai_advice(monthly_income, total_expense, balance, savings, expense_summary)
-                st.markdown("### 💡 Gemini's Advice")
-                st.write(advice)
-            except Exception as err:
-                st.error(f"Error Code: {err}")
-
-#=====================STEP 13: CHAT WITH YOUR PLANNER====================
-st.subheader("💬 Chat with Your Budget Planner")
-
-for msg in st.session_state.chat_history:
-    with st.chat_message(msg["role"]):
-        st.write(msg["content"])
-
-user_msg = st.chat_input("Ask about your budget, savings, or forecast...")
-
-if user_msg:
-    if not GEMINI_API_KEY:
-        st.error("Give API key first in the sidebar")
-    else:
-        st.session_state.chat_history.append({"role": "user", "content": user_msg})
-        with st.chat_message("user"):
-            st.write(user_msg)
-
-        budget_context = f"""
-        Monthly Income: ₹{monthly_income}
-        Total Expense: ₹{total_expense}
-        Balance: ₹{balance}
-        Savings Goal: {st.session_state.goal.get('name', 'N/A')} - target ₹{st.session_state.goal.get('amount', 0)} in {st.session_state.goal.get('months', 0)} months
-        """
-
-        chat_prompt = ChatPromptTemplate.from_messages([
-            ("system",
-             "You are a friendly, concise personal finance advisor. "
-             "Use the budget context below to answer the user's question.\n"
-             "Context:\n" + budget_context),
-            MessagesPlaceholder(variable_name = "history"),
-            ("human", "{input}")
-        ])
-
-        chat_model = ChatGoogleGenerativeAI(
-            model = "gemini-3.5-flash-lite",
-            google_api_key = GEMINI_API_KEY,
-            temperature = 0.7
-        )
-
-        chat_chain = chat_prompt | chat_model | StrOutputParser()
-
-        history_messages = []
-        for m in st.session_state.chat_history[:-1]:
-            if m["role"] == "user":
-                history_messages.append(HumanMessage(content = m["content"]))
-            else:
-                history_messages.append(AIMessage(content = m["content"]))
-
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                try:
-                    reply = chat_chain.invoke({"history": history_messages, "input": user_msg})
-                    st.write(reply)
-                    st.session_state.chat_history.append({"role": "assistant", "content": reply})
-                except Exception as err:
-                    st.error(f"Error Code: {err}")
-
-#=====================STEP 14: EXPORT & SHARE REPORT====================
-st.subheader("📤 Export & Share Report")
-
-report_text = (
-    "AI Personal Budget Planner Report\n"
-    "-----------------------------------\n"
-    f"Monthly Income: Rs. {monthly_income:,.2f}\n"
-    f"Total Expense: Rs. {total_expense:,.2f}\n"
-    f"Balance: Rs. {balance:,.2f}\n"
-    f"Savings: Rs. {savings:,.2f}\n\n"
-    f"Savings Goal: {st.session_state.goal.get('name', 'N/A')}\n"
-    f"Target: Rs. {st.session_state.goal.get('amount', 0):,.2f} in {st.session_state.goal.get('months', 0)} months\n"
+# using tabs so everything doesnt look like one giant scrolling page
+tab_add, tab_dash, tab_forecast, tab_advisor, tab_chat, tab_share = st.tabs(
+    ["Add Expense", "Dashboard", "Forecast", "AI Advisor", "Chat", "Share/Export"]
 )
 
-exp_col1, exp_col2, exp_col3 = st.columns(3)
+# =========================================================
+# TAB 1 - ADD EXPENSE
+# =========================================================
+with tab_add:
+    st.subheader("Add Expense")
 
-with exp_col1:
-    st.markdown("**Download CSV**")
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+        category = st.selectbox("Category", ["Food", "Rent", "Transport", "Shopping", "Entertainment", "Utilities", "Other"])
+        custom_cat = ""
+        if category == "Other":
+            custom_cat = st.text_input("Custom Category Name")
+    with c2:
+        remark = st.text_input("Remark (optional)")
+    with c3:
+        amount = st.number_input("Amount (₹)", min_value=0.0, step=50.0)
+    with c4:
+        st.write("")
+        st.write("")
+        add_btn = st.button("Add Expense")
+
+    if add_btn:
+        # agar user ne Other select kiya to custom name use karo
+        final_cat = custom_cat.strip() if category == "Other" and custom_cat.strip() != "" else category
+
+        if amount > 0:
+            new_row = pd.DataFrame([{"Category": final_cat, "Remark": remark, "Amount": amount}])
+            st.session_state.expenses = pd.concat([st.session_state.expenses, new_row], ignore_index=True)
+            st.session_state.expenses["Amount"] = pd.to_numeric(st.session_state.expenses["Amount"], errors="coerce").fillna(0.0)
+            save_expenses(st.session_state.expenses)
+            st.success("Added " + final_cat + " : ₹" + str(amount))
+        else:
+            st.warning("amount should be more than 0")
+
+    st.write("---")
+    st.subheader("Expense Table")
+
+    if st.session_state.expenses.empty:
+        st.info("No expenses added yet")
+    else:
+        # data_editor lets user edit/delete rows directly, found this in streamlit docs
+        edited = st.data_editor(st.session_state.expenses, use_container_width=True, num_rows="dynamic")
+
+        col_save, col_clear = st.columns(2)
+        with col_save:
+            if st.button("Save Changes"):
+                edited["Amount"] = pd.to_numeric(edited["Amount"], errors="coerce").fillna(0.0)
+                st.session_state.expenses = edited
+                save_expenses(st.session_state.expenses)
+                st.success("saved")
+        with col_clear:
+            if st.button("Clear All"):
+                st.session_state.expenses = pd.DataFrame(columns=cols)
+                save_expenses(st.session_state.expenses)
+                st.rerun()
+
+    st.write("---")
+    st.subheader("Category Budget Limit (optional)")
+    st.caption("set a limit for a category, resets when you close the app (didnt save this to file yet)")
+
+    bcol = st.columns(4)
+    limit_cats = ["Food", "Rent", "Transport", "Shopping"]
+    for i in range(len(limit_cats)):
+        cat = limit_cats[i]
+        with bcol[i]:
+            st.session_state.budgets[cat] = st.number_input(cat + " Limit", min_value=0.0, step=500.0, key="lim_" + cat)
+
+# =========================================================
+# TAB 2 - DASHBOARD
+# =========================================================
+with tab_dash:
+    total_exp = st.session_state.expenses["Amount"].sum() if not st.session_state.expenses.empty else 0.0
+    balance = income - total_exp
+    savings = balance  # savings = balance basically, keeping separate var for readability
+
+    st.subheader("Summary")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Income", f"₹{income:,.2f}")
+    m2.metric("Total Expense", f"₹{total_exp:,.2f}")
+    m3.metric("Balance", f"₹{balance:,.2f}")
+    m4.metric("Savings", f"₹{savings:,.2f}")
+
     if not st.session_state.expenses.empty:
-        csv_data = st.session_state.expenses.to_csv(index = False)
-        st.download_button("⬇️ Download Expenses CSV", data = csv_data, file_name = "my_expenses.csv", mime = "text/csv")
-    else:
-        st.info("Add expenses to enable download")
+        cat_totals = st.session_state.expenses.groupby("Category")["Amount"].sum()
 
-with exp_col2:
-    st.markdown("**Send Report via Email**")
-    with st.expander("Email settings"):
-        sender_email = st.text_input("Your Email (Gmail)", key = "sender_email")
-        sender_password = st.text_input("App Password", type = "password", key = "sender_password")
-        receiver_email = st.text_input("Send Report To", key = "receiver_email")
-        st.caption(
-            "Use a Gmail App Password, not your normal password. "
-            "Credentials are used only for this session and are not stored."
-        )
-        if st.button("📧 Send Email Report"):
-            if not (sender_email and sender_password and receiver_email):
-                st.warning("Fill in all email fields first")
-            else:
+        colp, colb = st.columns(2)
+        with colp:
+            st.write("Expense Breakdown (Pie)")
+            fig1, ax1 = plt.subplots()
+            ax1.pie(cat_totals.values, labels=cat_totals.index, autopct="%1.1f%%")
+            st.pyplot(fig1)
+
+        with colb:
+            st.write("Expense by Category (Bar)")
+            fig2, ax2 = plt.subplots()
+            ax2.bar(cat_totals.index, cat_totals.values)
+            plt.xticks(rotation=30)
+            st.pyplot(fig2)
+
+        st.write("---")
+        st.subheader("Budget Limit Check")
+        for cat in st.session_state.budgets:
+            lim = st.session_state.budgets[cat]
+            if lim > 0:
+                spent = st.session_state.expenses.loc[st.session_state.expenses["Category"] == cat, "Amount"].sum()
+                st.write(cat, ":", spent, "/", lim)
+                st.progress(min(spent / lim, 1.0))
+                if spent > lim:
+                    st.error(cat + " budget over ho gaya!")
+    else:
+        st.info("add some expenses to see chart")
+
+    st.write("---")
+    st.subheader("Saving Tips")
+    if income > 0:
+        rate = (savings / income) * 100
+        if rate < 20:
+            st.warning(f"savings is only {rate:.1f}% of income, try to save atleast 20%")
+        else:
+            st.success(f"nice, you are saving {rate:.1f}% of income")
+
+        if not st.session_state.expenses.empty:
+            food_amt = st.session_state.expenses.loc[st.session_state.expenses["Category"] == "Food", "Amount"].sum()
+            if food_amt > 0.15 * income:
+                st.warning("food expense is quite high, try cooking at home more often")
+
+        if total_exp > income:
+            st.error("you are spending more than you earn this month!")
+
+        st.markdown("""
+        - try to save money as soon as salary comes  
+        - track small expenses too, they add up  
+        - cancel subscriptions you dont use  
+        - keep some emergency fund
+        """)
+    else:
+        st.info("enter income to see tips")
+
+# =========================================================
+# TAB 3 - FORECAST
+# =========================================================
+with tab_forecast:
+    total_exp = st.session_state.expenses["Amount"].sum() if not st.session_state.expenses.empty else 0.0
+
+    st.subheader("Forecast")
+    st.caption("simple projection based on your current numbers")
+
+    if not st.session_state.expenses.empty and income > 0:
+        horizon = st.radio("Forecast for", ["Monthly", "Yearly"], horizontal=True)
+        proj_saving = income - total_exp
+
+        if horizon == "Monthly":
+            x = list(range(1, 7))
+            y = [proj_saving * i for i in x]
+            xlabel = "next 6 months"
+        else:
+            x = list(range(1, 6))
+            y = [proj_saving * 12 * i for i in x]
+            xlabel = "next 5 years"
+
+        fig4, ax4 = plt.subplots()
+        ax4.plot(x, y, marker="o", color="green")
+        ax4.set_xlabel(xlabel)
+        ax4.set_ylabel("Projected Savings")
+        st.pyplot(fig4)
+
+        st.write("Current Monthly Expense:", round(total_exp, 2))
+        st.write("Projected Yearly Expense:", round(total_exp * 12, 2))
+        st.write("Projected Yearly Savings:", round(proj_saving * 12, 2))
+    else:
+        st.info("enter income and add expenses first")
+
+# =========================================================
+# TAB 4 - AI ADVISOR
+# =========================================================
+with tab_advisor:
+    total_exp = st.session_state.expenses["Amount"].sum() if not st.session_state.expenses.empty else 0.0
+    balance = income - total_exp
+
+    # this just builds a text summary of budget to send to gemini
+    def get_context():
+        exp_summary = st.session_state.expenses.groupby("Category")["Amount"].sum().to_string() if not st.session_state.expenses.empty else "No expenses recorded"
+        return f"""
+        Monthly Income: {income}
+        Total Expense: {total_exp}
+        Balance: {balance}
+        Expense Breakdown:
+        {exp_summary}
+        """
+
+    st.subheader("AI Financial Advisor")
+    if st.button("Get AI Financial Advice"):
+        if not GEMINI_API_KEY:
+            st.error("give api key in sidebar first")
+        elif income == 0:
+            st.warning("enter monthly income first")
+        else:
+            with st.spinner("asking gemini.."):
                 try:
-                    msg = MIMEMultipart()
-                    msg["From"] = sender_email
-                    msg["To"] = receiver_email
-                    msg["Subject"] = "My Budget Report"
-                    msg.attach(MIMEText(report_text, "plain"))
-                    with smtplib.SMTP("smtp.gmail.com", 587) as server:
-                        server.starttls()
-                        server.login(sender_email, sender_password)
-                        server.sendmail(sender_email, receiver_email, msg.as_string())
-                    st.success("Report sent via email!")
-                except Exception as err:
-                    st.error(f"Could not send email: {err}")
+                    advisor_prompt = ChatPromptTemplate.from_template(
+                        "You are a friendly personal finance advisor. {context} "
+                        "Give me 3-5 short practical tips to improve my budget and savings."
+                    )
+                    chain = advisor_prompt | get_gemini_model() | StrOutputParser()
+                    result = chain.invoke({"context": get_context()})
+                    st.markdown("### Gemini's Advice")
+                    st.write(result)
+                except Exception as e:
+                    st.error("Error: " + str(e))
 
-with exp_col3:
-    st.markdown("**Send Report via WhatsApp**")
-    whatsapp_number = st.text_input(
-        "WhatsApp Number (with country code, no +)", key = "wa_number", placeholder = "919999999999"
-    )
-    if whatsapp_number:
-        encoded_text = urllib.parse.quote(report_text)
-        wa_link = f"https://wa.me/{whatsapp_number}?text={encoded_text}"
-        st.link_button("💬 Share on WhatsApp", wa_link)
+    st.write("---")
+    st.warning("⚠️ Disclaimer: Yeh AI advice sirf general guidance ke liye hai. Kripya koi bhi bada financial decision lene se pehle ek certified financial adviser se consult karo.")
+
+# =========================================================
+# TAB 5 - CHAT
+# =========================================================
+with tab_chat:
+    total_exp = st.session_state.expenses["Amount"].sum() if not st.session_state.expenses.empty else 0.0
+    balance = income - total_exp
+
+    st.subheader("Chat with your Planner")
+    st.caption("ask stuff like 'where can i cut cost' or 'can i afford a 5000 trip'")
+
+    for m in st.session_state.chat_history:
+        with st.chat_message(m["role"]):
+            st.write(m["content"])
+
+    q = st.chat_input("Ask something...")
+
+    if q:
+        st.session_state.chat_history.append({"role": "user", "content": q})
+        with st.chat_message("user"):
+            st.write(q)
+
+        if not GEMINI_API_KEY:
+            ans = "give api key in sidebar to use chat"
+        else:
+            try:
+                exp_summary = st.session_state.expenses.groupby("Category")["Amount"].sum().to_string() if not st.session_state.expenses.empty else "No expenses recorded"
+                chat_prompt = ChatPromptTemplate.from_template(
+                    """You are a budget planning assistant.
+                    Income: {income}, Expense: {total_exp}, Balance: {balance}
+                    Expense breakdown: {exp_summary}
+                    Question: {question}
+                    Answer short and clear."""
+                )
+                chain = chat_prompt | get_gemini_model() | StrOutputParser()
+                ans = chain.invoke({
+                    "income": income,
+                    "total_exp": total_exp,
+                    "balance": balance,
+                    "exp_summary": exp_summary,
+                    "question": q
+                })
+            except Exception as e:
+                ans = "Error: " + str(e)
+
+        st.session_state.chat_history.append({"role": "assistant", "content": ans})
+        with st.chat_message("assistant"):
+            st.write(ans)
+
+# =========================================================
+# TAB 6 - SHARE / EXPORT
+# =========================================================
+with tab_share:
+    total_exp = st.session_state.expenses["Amount"].sum() if not st.session_state.expenses.empty else 0.0
+    balance = income - total_exp
+
+    st.subheader("Export Data")
+    if not st.session_state.expenses.empty:
+        csv_data = st.session_state.expenses.to_csv(index=False)
+        st.download_button("Download CSV", data=csv_data, file_name="my_expenses.csv", mime="text/csv")
     else:
-        st.info("Enter a WhatsApp number to share")
+        st.info("add expenses first to download")
 
-#=====================STEP 15: DISCLAIMER====================
-st.divider()
-with st.expander("⚠️ Disclaimer"):
-    st.caption(
-        "This app is for educational purposes only and does not constitute professional "
-        "financial, investment, or tax advice. AI-generated advice, the chat responses, and the "
-        "forecast are estimates based on the numbers you enter and simple growth assumptions — "
-        "they are not guarantees of future performance. Please consult a certified financial "
-        "advisor before making major financial decisions. Email credentials you enter above are "
-        "used only to send the report during this session and are not stored or transmitted "
-        "anywhere else by this app."
-    )
+    st.write("---")
+    st.subheader("Share Report")
+
+    # builds the text report we send over email/whatsapp
+    exp_summary = st.session_state.expenses.groupby("Category")["Amount"].sum().to_string() if not st.session_state.expenses.empty else "No expenses recorded"
+    report_text = f"""AI Personal Budget Planner Report
+
+Monthly Income: Rs.{income:,.2f}
+Total Expense: Rs.{total_exp:,.2f}
+Balance: Rs.{balance:,.2f}
+
+Expense Breakdown:
+{exp_summary}
+
+- generated by AI Personal Budget Planner"""
+
+    colA, colB = st.columns(2)
+
+    with colA:
+        st.write("Send via Email")
+        to_email = st.text_input("Recipient Email")
+
+        # just building the mail as a template here, not sending it ourself
+        # this opens gmail in browser (already logged in) or default mail app
+        subject = "Your Monthly Budget Report"
+        mail_subject = urllib.parse.quote(subject)
+        mail_body = urllib.parse.quote(report_text)
+
+        if st.button("Prepare Mail"):
+            if not to_email:
+                st.warning("enter recipient email first")
+            else:
+                to_encoded = urllib.parse.quote(to_email)
+                gmail_url = f"https://mail.google.com/mail/?view=cm&fs=1&to={to_encoded}&su={mail_subject}&body={mail_body}"
+                mailto_url = f"mailto:{to_email}?subject={mail_subject}&body={mail_body}"
+
+                st.success("mail template ready, click below to send")
+                st.link_button("Open in Gmail (web)", gmail_url)
+                st.link_button("Open in Mail App", mailto_url)
+                st.caption("this just opens the mail already filled in, using your own logged in gmail / mail app. we dont touch your password.")
+
+    with colB:
+        st.write("Send via WhatsApp")
+        wa_text = urllib.parse.quote(report_text)
+        wa_url = "https://wa.me/?text=" + wa_text
+        st.link_button("Share on WhatsApp", wa_url)
+        st.caption("opens whatsapp, pick a contact and send")
+
+# TODO: maybe add monthly comparison graph later
+# TODO: pdf export instead of just csv
