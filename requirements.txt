@@ -1,5 +1,7 @@
-streamlit>=1.32
+streamlit
 pandas
 matplotlib
-python-dotenv
-google-generativeai
+langchain
+langchain-core
+langchain-google-genai
+langchain-groq
