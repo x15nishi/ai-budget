@@ -4,4 +4,3 @@ matplotlib
 langchain
 langchain-core
 langchain-google-genai
-langchain-groq
