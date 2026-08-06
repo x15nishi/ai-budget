@@ -305,7 +305,7 @@ with tab_advisor:
 
         Give me 3-5 short, practical tips to improve my budget and savings.
         """
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-3.5-flash-lite")
         response = model.generate_content(prompt)
         return response.text
 
@@ -371,7 +371,7 @@ with tab_chat:
                 User question: {user_msg}
                 Answer clearly and keep it short.
                 """
-                model = genai.GenerativeModel("gemini-1.5-flash")
+                model = genai.GenerativeModel("gemini-3.5-flash-lite")
                 reply = model.generate_content(chat_prompt).text
             except Exception as err:
                 reply = f"Error Code: {err}"
