@@ -41,8 +41,6 @@ else:
     st.sidebar.info("Give API key")
     st.sidebar.markdown("Get key from https://aistudio.google.com/app/apikey")
 
-st.sidebar.divider()
-st.sidebar.caption("Report email uses your own Gmail in the browser, no login needed here.")
 
 
 # loads expense data from csv, if file not there just make empty table
@@ -85,20 +83,18 @@ tab_add, tab_dash, tab_forecast, tab_advisor, tab_chat, tab_share = st.tabs(
 with tab_add:
     st.subheader("Add Expense")
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4 = st.columns(4)
 
     with c1:
-        exp_date = st.date_input("Date", value=date.today())
-    with c2:
         category = st.selectbox("Category", ["Food", "Rent", "Transport", "Shopping", "Entertainment", "Utilities", "Other"])
         custom_cat = ""
         if category == "Other":
             custom_cat = st.text_input("Custom Category Name")
-    with c3:
+    with c2:
         remark = st.text_input("Remark (optional)")
-    with c4:
+    with c3:
         amount = st.number_input("Amount (₹)", min_value=0.0, step=50.0)
-    with c5:
+    with c4:
         st.write("")
         st.write("")
         add_btn = st.button("Add Expense")
@@ -108,7 +104,7 @@ with tab_add:
         final_cat = custom_cat.strip() if category == "Other" and custom_cat.strip() != "" else category
 
         if amount > 0:
-            new_row = pd.DataFrame([{"Date": exp_date.isoformat(), "Category": final_cat, "Remark": remark, "Amount": amount}])
+            new_row = pd.DataFrame([{"Date": date.today().isoformat(), "Category": final_cat, "Remark": remark, "Amount": amount}])
             st.session_state.expenses = pd.concat([st.session_state.expenses, new_row], ignore_index=True)
             st.session_state.expenses["Amount"] = pd.to_numeric(st.session_state.expenses["Amount"], errors="coerce").fillna(0.0)
             save_expenses(st.session_state.expenses)
