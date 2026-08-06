@@ -4,7 +4,6 @@
 
 import os
 import urllib.parse
-from datetime import date
 
 import pandas as pd
 import streamlit as st
@@ -15,7 +14,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DATA_FILE = "data.csv"
-cols = ["Date", "Category", "Remark", "Amount"]  # columns for the expense table
+cols = ["Category", "Remark", "Amount"]  # columns for the expense table
 
 st.set_page_config(page_title="AI Personal Budget Planner", layout="wide", page_icon="💰")
 
@@ -104,7 +103,7 @@ with tab_add:
         final_cat = custom_cat.strip() if category == "Other" and custom_cat.strip() != "" else category
 
         if amount > 0:
-            new_row = pd.DataFrame([{"Date": date.today().isoformat(), "Category": final_cat, "Remark": remark, "Amount": amount}])
+            new_row = pd.DataFrame([{"Category": final_cat, "Remark": remark, "Amount": amount}])
             st.session_state.expenses = pd.concat([st.session_state.expenses, new_row], ignore_index=True)
             st.session_state.expenses["Amount"] = pd.to_numeric(st.session_state.expenses["Amount"], errors="coerce").fillna(0.0)
             save_expenses(st.session_state.expenses)
@@ -223,27 +222,11 @@ with tab_forecast:
     total_exp = st.session_state.expenses["Amount"].sum() if not st.session_state.expenses.empty else 0.0
 
     st.subheader("Forecast")
-    st.caption("uses your actual monthly data if you have more than 1 month of entries, else just does simple projection")
+    st.caption("simple projection based on your current numbers")
 
     if not st.session_state.expenses.empty and income > 0:
-        temp = st.session_state.expenses.copy()
-        temp["Date"] = pd.to_datetime(temp["Date"], errors="coerce")
-        temp["Month"] = temp["Date"].dt.to_period("M").astype(str)
-        month_totals = temp.groupby("Month")["Amount"].sum()
-
-        if len(month_totals) > 1:
-            st.write("Monthly Expense History")
-            fig3, ax3 = plt.subplots()
-            ax3.plot(month_totals.index, month_totals.values, marker="o")
-            plt.xticks(rotation=30)
-            st.pyplot(fig3)
-            avg_exp = month_totals.mean()
-        else:
-            st.info("add expenses on different dates to see real trend, using current total for now")
-            avg_exp = total_exp
-
         horizon = st.radio("Forecast for", ["Monthly", "Yearly"], horizontal=True)
-        proj_saving = income - avg_exp
+        proj_saving = income - total_exp
 
         if horizon == "Monthly":
             x = list(range(1, 7))
@@ -260,8 +243,8 @@ with tab_forecast:
         ax4.set_ylabel("Projected Savings")
         st.pyplot(fig4)
 
-        st.write("Avg Monthly Expense:", round(avg_exp, 2))
-        st.write("Projected Yearly Expense:", round(avg_exp * 12, 2))
+        st.write("Current Monthly Expense:", round(total_exp, 2))
+        st.write("Projected Yearly Expense:", round(total_exp * 12, 2))
         st.write("Projected Yearly Savings:", round(proj_saving * 12, 2))
     else:
         st.info("enter income and add expenses first")
@@ -294,7 +277,7 @@ with tab_advisor:
             with st.spinner("asking gemini.."):
                 try:
                     prompt = "You are a friendly personal finance advisor. " + get_context() + " Give me 3-5 short practical tips to improve my budget and savings."
-                    model = genai.GenerativeModel("gemini-1.5-flash")
+                    model = genai.GenerativeModel("gemini-3.5-flash-lite")
                     result = model.generate_content(prompt)
                     st.markdown("### Gemini's Advice")
                     st.write(result.text)
@@ -335,7 +318,7 @@ with tab_chat:
                 Expense breakdown: {exp_summary}
                 Question: {q}
                 Answer short and clear."""
-                model = genai.GenerativeModel("gemini-1.5-flash")
+                model = genai.GenerativeModel("gemini-3.5-flash-lite")
                 ans = model.generate_content(chat_prompt).text
             except Exception as e:
                 ans = "Error: " + str(e)
