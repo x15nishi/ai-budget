@@ -40,7 +40,7 @@ elif all(ALL_API):
     st.sidebar.success("API KEY LOADED")
 
     if provider == "Gemini":
-        options = ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
+        options = ["gemini-3.5-flash-lite-lite", "gemini-3.5-flash-lite"]
         selected_model = st.sidebar.selectbox("Select-Model", options = options)
         model = ChatGoogleGenerativeAI(
             model = selected_model,
