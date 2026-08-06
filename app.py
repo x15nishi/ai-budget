@@ -1,37 +1,74 @@
-#======STEP 1: LOAD MODULES=====#
-import os
-import pandas as pd
+#======Modules=====#
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 import streamlit as st
+import pandas as pd
 import matplotlib.pyplot as plt
-import google.generativeai as genai
+import os
 
 st.set_page_config(page_title = "AI Personal Budget Planner", layout = "wide")
+
+#===============STEP 1 TITLE AND HEADER==============
 st.title("AI Personal Budget Planner 💰")
 st.header("""Track your income, expenses, and get AI powered budget advice""")
 
-#===============STEP 2: LOAD API-KEY==============
-st.sidebar.title("Give API KEY")
-GEMINI_API_KEY = st.sidebar.text_input("GEMINI_API_KEY", type = "password")
+#===============STEP 2 LOAD API-KEYS==============
+st.sidebar.title("Give API KEYS")
 
-if GEMINI_API_KEY:
-    st.sidebar.success("API key Loaded!!")
-    genai.configure(api_key = GEMINI_API_KEY)
+provider = st.sidebar.selectbox("Select Provider", ["Gemini", "Groq"])
+
+if provider == "Gemini":
+    API_KEY = st.sidebar.text_input("GOOGLE_API_KEY", type = "password")
 else:
-    st.sidebar.info("Give API key")
-    url = "https://aistudio.google.com/app/apikey"
-    st.sidebar.markdown(f"Get Gemini API Key-{url}")
+    API_KEY = st.sidebar.text_input("GROQ_API_KEY", type = "password")
 
-#=========================STEP 3: SESSION STATE========================#
+ALL_API = [API_KEY]
+
+if not all(ALL_API):
+    st.sidebar.error("Must Pass API-KEY")
+
+    if provider == "Gemini":
+        url = "https://aistudio.google.com/app/apikey"
+        st.sidebar.markdown(f"Get Gemini API Key-{url}")
+    else:
+        url = "https://console.groq.com/keys"
+        st.sidebar.markdown(f"Get Groq API Key-{url}")
+
+elif all(ALL_API):
+    st.sidebar.success("API KEY LOADED")
+
+    if provider == "Gemini":
+        options = ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
+        selected_model = st.sidebar.selectbox("Select-Model", options = options)
+        model = ChatGoogleGenerativeAI(
+            model = selected_model,
+            google_api_key = API_KEY,
+            temperature = 0.7
+        )
+    else:
+        options = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+        selected_model = st.sidebar.selectbox("Select-Model", options = options)
+        model = ChatGroq(
+            model = selected_model,
+            groq_api_key = API_KEY,
+            temperature = 0.7
+        )
+else:
+    st.sidebar.info("Try Valid API-key")
+
+#=========================STEP 3 SESSION STATE============================#
 # session_state is used so streamlit does not forget our expense table
 # on every rerun
 if "expenses" not in st.session_state:
     st.session_state.expenses = pd.DataFrame(columns = ["Category", "Amount"])
 
-#=====================STEP 4: INCOME INPUT======================
+#=====================STEP 4 INCOME INPUT======================
 st.subheader("Monthly Income")
 monthly_income = st.number_input("Enter Monthly Income (₹)", min_value = 0.0, step = 500.0)
 
-#=====================STEP 5: ADD EXPENSE FORM====================
+#=====================STEP 5 ADD EXPENSE FORM====================
 st.subheader("Add Expense")
 
 col1, col2, col3 = st.columns(3)
@@ -54,7 +91,7 @@ if add_clicked:
     else:
         st.warning("Amount should be greater than 0")
 
-#=====================STEP 6: SHOW EXPENSE TABLE====================
+#=====================STEP 6 SHOW EXPENSE TABLE====================
 st.subheader("Expense Table")
 
 if st.session_state.expenses.empty:
@@ -65,7 +102,7 @@ else:
         st.session_state.expenses = pd.DataFrame(columns = ["Category", "Amount"])
         st.rerun()
 
-#=====================STEP 7: CALCULATE TOTALS====================
+#=====================STEP 7 CALCULATE TOTALS====================
 total_expense = st.session_state.expenses["Amount"].sum() if not st.session_state.expenses.empty else 0.0
 balance = monthly_income - total_expense
 savings = balance
@@ -77,7 +114,7 @@ c2.metric("Total Expense", f"₹{total_expense:,.2f}")
 c3.metric("Balance", f"₹{balance:,.2f}")
 c4.metric("Savings", f"₹{savings:,.2f}")
 
-#=====================STEP 8: PIE CHART====================
+#=====================STEP 8 PIE CHART====================
 st.subheader("Expense Breakdown")
 
 if not st.session_state.expenses.empty:
@@ -89,7 +126,7 @@ if not st.session_state.expenses.empty:
 else:
     st.info("Add expenses to see the chart")
 
-#=====================STEP 9: RULE BASED TIPS====================
+#=====================STEP 9 RULE BASED TIPS====================
 st.subheader("Quick Tips")
 
 if monthly_income > 0:
@@ -110,44 +147,58 @@ if monthly_income > 0:
 else:
     st.info("Enter income to see tips")
 
-#=====================STEP 10: AI FINANCIAL ADVISOR====================
+#=========================STEP 10 BACKEND============================#
+# get_ai_advice using langchain
+def get_ai_advice(income, expense, balance, savings, expense_summary):
+  """This function helps to give
+  personalized budget advice using langchain
+  based on given income, expense, balance, savings and expense_summary"""
+
+  prompt = ChatPromptTemplate.from_template(
+      """
+      You are a friendly personal finance advisor.
+      Monthly Income: ₹{income}
+      Total Expense: ₹{expense}
+      Balance: ₹{balance}
+      Savings: ₹{savings}
+      Expense Breakdown:
+      {expense_summary}
+
+      Give me 3-5 short, practical tips to improve my budget and savings.
+      """
+  )
+
+  chain = prompt | model | StrOutputParser()
+
+  response = chain.invoke({
+      "income": income,
+      "expense": expense,
+      "balance": balance,
+      "savings": savings,
+      "expense_summary": expense_summary
+  })
+
+  return response
+
+#=====================STEP 11 AI FINANCIAL ADVISOR====================
 st.subheader("AI Financial Advisor")
 
-def get_ai_advice(income, expense, balance, savings, expense_summary):
-    """This function sends the budget summary
-    to gemini model and returns personalized
-    financial advice based on given data"""
-    prompt = f"""
-    You are a friendly personal finance advisor.
-    Monthly Income: ₹{income}
-    Total Expense: ₹{expense}
-    Balance: ₹{balance}
-    Savings: ₹{savings}
-    Expense Breakdown:
-    {expense_summary}
-
-    Give me 3-5 short, practical tips to improve my budget and savings.
-    """
-    model = genai.GenerativeModel("gemini-3.5-flash-lite")
-    response = model.generate_content(prompt)
-    return response.text
-
 if st.button("🤖 Get AI Financial Advice"):
-    if not GEMINI_API_KEY:
-        st.error("Give API key first in the sidebar")
+    if not all(ALL_API):
+        st.error("Give API-Key First")
     elif monthly_income == 0:
         st.warning("Enter monthly income first")
     else:
-        with st.spinner("Asking Gemini for advice.."):
+        with st.spinner("Running Agent"):
             try:
                 expense_summary = st.session_state.expenses.groupby("Category")["Amount"].sum().to_string() if not st.session_state.expenses.empty else "No expenses recorded"
                 advice = get_ai_advice(monthly_income, total_expense, balance, savings, expense_summary)
-                st.markdown("### 💡 Gemini's Advice")
+                st.markdown("### 💡 AI Advice")
                 st.write(advice)
             except Exception as err:
                 st.error(f"Error Code: {err}")
 
-#=====================STEP 11: DOWNLOAD CSV====================
+#=====================STEP 12 DOWNLOAD CSV====================
 st.subheader("Export Data")
 
 if not st.session_state.expenses.empty:
