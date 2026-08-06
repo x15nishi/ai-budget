@@ -3,11 +3,8 @@
 # made this to track monthly budget and get AI tips
 
 import os
-import ssl
-import smtplib
 import urllib.parse
 from datetime import date
-from email.mime.text import MIMEText
 
 import pandas as pd
 import streamlit as st
@@ -45,10 +42,7 @@ else:
     st.sidebar.markdown("Get key from https://aistudio.google.com/app/apikey")
 
 st.sidebar.divider()
-st.sidebar.title("Email Setup (optional)")
-SENDER_EMAIL = st.sidebar.text_input("Your Gmail")
-SENDER_APP_PASSWORD = st.sidebar.text_input("Gmail App Password", type="password")
-st.sidebar.caption("only needed if you want to mail the report. use app password not your real gmail password")
+st.sidebar.caption("Report email uses your own Gmail in the browser, no login needed here.")
 
 
 # loads expense data from csv, if file not there just make empty table
@@ -389,28 +383,25 @@ Expense Breakdown:
     with colA:
         st.write("Send via Email")
         to_email = st.text_input("Recipient Email")
-        if st.button("Send Report by Mail"):
-            if not (SENDER_EMAIL and SENDER_APP_PASSWORD):
-                st.error("fill sender email + app password in sidebar first")
-            elif not to_email:
-                st.warning("enter recipient email")
-            else:
-                with st.spinner("sending mail.."):
-                    try:
-                        msg = MIMEText(report_text)
-                        msg["Subject"] = "Your Monthly Budget Report"
-                        msg["From"] = SENDER_EMAIL
-                        msg["To"] = to_email
 
-                        ctx = ssl.create_default_context()
-                        server = smtplib.SMTP("smtp.gmail.com", 587)
-                        server.starttls(context=ctx)
-                        server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
-                        server.sendmail(SENDER_EMAIL, to_email, msg.as_string())
-                        server.quit()
-                        st.success("mail sent!")
-                    except Exception as e:
-                        st.error("Error: " + str(e))
+        # just building the mail as a template here, not sending it ourself
+        # this opens gmail in browser (already logged in) or default mail app
+        subject = "Your Monthly Budget Report"
+        mail_subject = urllib.parse.quote(subject)
+        mail_body = urllib.parse.quote(report_text)
+
+        if st.button("Prepare Mail"):
+            if not to_email:
+                st.warning("enter recipient email first")
+            else:
+                to_encoded = urllib.parse.quote(to_email)
+                gmail_url = f"https://mail.google.com/mail/?view=cm&fs=1&to={to_encoded}&su={mail_subject}&body={mail_body}"
+                mailto_url = f"mailto:{to_email}?subject={mail_subject}&body={mail_body}"
+
+                st.success("mail template ready, click below to send")
+                st.link_button("Open in Gmail (web)", gmail_url)
+                st.link_button("Open in Mail App", mailto_url)
+                st.caption("this just opens the mail already filled in, using your own logged in gmail / mail app. we dont touch your password.")
 
     with colB:
         st.write("Send via WhatsApp")
