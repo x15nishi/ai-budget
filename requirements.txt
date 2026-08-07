@@ -1,6 +1,6 @@
 streamlit
 pandas
 matplotlib
-langchain
-langchain-core
-langchain-google-genai
+python-dotenv
+google-generativeai
+
