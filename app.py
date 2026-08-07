@@ -25,6 +25,20 @@ try:
 except Exception:
     OCR_AVAILABLE = False
 
+# PDF table extraction - optional, only needed for PDF bank statements
+try:
+    import pdfplumber
+    PDF_AVAILABLE = True
+except Exception:
+    PDF_AVAILABLE = False
+
+# DOCX table extraction - optional, only needed for Word bank statements
+try:
+    import docx  # python-docx
+    DOCX_AVAILABLE = True
+except Exception:
+    DOCX_AVAILABLE = False
+
 load_dotenv()
 
 DATA_FILE = "data.csv"
@@ -95,6 +109,21 @@ if not OCR_AVAILABLE:
         "binary isn't installed on this machine. Receipt scanning will be "
         "disabled until that's fixed. See requirements.txt for setup notes."
     )
+else:
+    # tesseract is a separate binary from the pytesseract python package - on
+    # Windows especially, "pip install" succeeding does NOT mean the binary is
+    # on PATH. This lets you point pytesseract straight at the .exe as a
+    # fallback if "OCR failed: tesseract is not installed or it's not in your
+    # PATH" keeps showing up even after installing it.
+    with st.sidebar.expander("⚙️ OCR settings (only if receipt scan keeps failing)"):
+        st.caption(
+            "If you installed Tesseract but still get a 'not in PATH' error, "
+            "paste the full path to tesseract.exe here. Typical Windows path: "
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        )
+        manual_tess_path = st.text_input("Tesseract binary path (optional)", value="", key="tess_path")
+        if manual_tess_path.strip():
+            pytesseract.pytesseract.tesseract_cmd = manual_tess_path.strip()
 
 
 # small helper so we don't repeat the same ChatGoogleGenerativeAI setup everywhere
@@ -324,28 +353,137 @@ with tab_import:
 
     st.write("---")
     st.subheader("🏦 Import from Bank Statement")
-    st.caption("upload a CSV/Excel export of your bank statement, map the columns, and bulk-add transactions")
+    st.caption("upload your statement as CSV, Excel (.xls/.xlsx), XML, or PDF - map the columns, and bulk-add transactions")
 
-    bank_file = st.file_uploader("Upload bank statement (CSV or Excel)", type=["csv", "xlsx", "xls"], key="bank_uploader")
+    # ---- robust reader: bank "excel" exports are frequently NOT what their
+    # extension claims. Very common in India: a bank labels a file .xls but it's
+    # actually an HTML table, or labels it .xlsx but it's actually old OLE .xls.
+    # We try several strategies in order rather than trusting the extension.
+    def read_bank_statement(uploaded_file):
+        """Returns (dataframe_or_None, list_of_extra_tables_or_None, error_message_or_None).
+        extra_tables is only populated for PDFs with multiple tables, so the
+        caller can let the user pick which table is the real transaction list."""
+        name = uploaded_file.name.lower()
+        raw = uploaded_file.read()
+        buf = io.BytesIO(raw)
+
+        # ---------- CSV ----------
+        if name.endswith(".csv"):
+            for enc in ["utf-8", "utf-8-sig", "latin-1"]:
+                try:
+                    buf.seek(0)
+                    return pd.read_csv(buf, encoding=enc), None, None
+                except Exception:
+                    continue
+            return None, None, "Could not parse this CSV with common encodings."
+
+        # ---------- XML ----------
+        if name.endswith(".xml"):
+            try:
+                buf.seek(0)
+                return pd.read_xml(buf), None, None
+            except Exception as e:
+                return None, None, f"Could not parse XML: {e}"
+
+        # ---------- XLSX / XLS (try real formats first, then HTML-in-disguise) ----------
+        if name.endswith((".xlsx", ".xls")):
+            # try as real xlsx (zip-based)
+            try:
+                buf.seek(0)
+                return pd.read_excel(buf, engine="openpyxl"), None, None
+            except Exception:
+                pass
+            # try as real legacy xls (OLE-based) - needs xlrd
+            try:
+                buf.seek(0)
+                return pd.read_excel(buf, engine="xlrd"), None, None
+            except ImportError:
+                pass
+            except Exception:
+                pass
+            # try as HTML table wearing an Excel extension (very common bank export)
+            try:
+                buf.seek(0)
+                tables = pd.read_html(buf)
+                if tables:
+                    # usually the largest table is the actual transaction list
+                    tables.sort(key=len, reverse=True)
+                    return tables[0], tables if len(tables) > 1 else None, None
+            except Exception:
+                pass
+            return None, None, (
+                "This file's contents don't match a real .xlsx, .xls, or HTML-based "
+                "export. Try re-exporting from your bank as CSV instead - it's the "
+                "most reliable format."
+            )
+
+        # ---------- PDF ----------
+        if name.endswith(".pdf"):
+            if not PDF_AVAILABLE:
+                return None, None, "PDF support needs `pdfplumber` - run `pip install pdfplumber` and restart."
+            try:
+                buf.seek(0)
+                all_tables = []
+                with pdfplumber.open(buf) as pdf:
+                    for page in pdf.pages:
+                        for tbl in page.extract_tables():
+                            if tbl and len(tbl) > 1:
+                                df_t = pd.DataFrame(tbl[1:], columns=tbl[0])
+                                all_tables.append(df_t)
+                if not all_tables:
+                    return None, None, (
+                        "No tables detected in this PDF. If it's a scanned/image PDF "
+                        "rather than a text-based statement, table extraction won't work - "
+                        "export as CSV/Excel from your bank instead."
+                    )
+                all_tables.sort(key=len, reverse=True)
+                return all_tables[0], all_tables if len(all_tables) > 1 else None, None
+            except Exception as e:
+                return None, None, f"Could not parse PDF: {e}"
+
+        # ---------- DOCX ----------
+        if name.endswith(".docx"):
+            if not DOCX_AVAILABLE:
+                return None, None, "DOCX support needs `python-docx` - run `pip install python-docx` and restart."
+            try:
+                buf.seek(0)
+                d = docx.Document(buf)
+                all_tables = []
+                for t in d.tables:
+                    rows = [[cell.text for cell in row.cells] for row in t.rows]
+                    if len(rows) > 1:
+                        all_tables.append(pd.DataFrame(rows[1:], columns=rows[0]))
+                if not all_tables:
+                    return None, None, "No tables found in this .docx file."
+                all_tables.sort(key=len, reverse=True)
+                return all_tables[0], all_tables if len(all_tables) > 1 else None, None
+            except Exception as e:
+                return None, None, f"Could not parse DOCX: {e}"
+
+        # ---------- old-style .doc (binary, pre-2007 Word) ----------
+        if name.endswith(".doc"):
+            return None, None, (
+                "Old-format .doc files aren't supported directly - they use a binary "
+                "format with no reliable pure-Python reader. Please save/export the "
+                "statement as .docx, .pdf, or .csv from Word and re-upload."
+            )
+
+        return None, None, "Unsupported file type."
+
+    bank_file = st.file_uploader(
+        "Upload bank statement (CSV, Excel, XML, PDF, or DOCX)",
+        type=["csv", "xlsx", "xls", "xml", "pdf", "docx"],
+        key="bank_uploader"
+    )
 
     if bank_file is not None:
-        try:
-            if bank_file.name.lower().endswith(".csv"):
-                bank_df = pd.read_csv(bank_file)
-            elif bank_file.name.lower().endswith(".xls"):
-                bank_df = pd.read_excel(bank_file, engine="xlrd")
-            else:
-                bank_df = pd.read_excel(bank_file, engine="openpyxl")
-        except ImportError as e:
-            bank_df = None
-            st.error(
-                "Missing a required Excel engine package: " + str(e) +
-                "\n\nRun `pip install openpyxl` (for .xlsx) or `pip install xlrd` (for .xls), "
-                "then restart the app and re-upload."
-            )
-        except Exception as e:
-            bank_df = None
-            st.error("couldn't read that file: " + str(e))
+        bank_df, extra_tables, err = read_bank_statement(bank_file)
+        if err:
+            st.error(err)
+
+        if extra_tables:
+            st.info(f"Found {len(extra_tables)} tables in this file - showing the largest one below. "
+                     "If it's the wrong one, re-export a cleaner file with just the transaction table.")
 
         if bank_df is not None and not bank_df.empty:
             st.write("Preview:")
