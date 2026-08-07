@@ -100,7 +100,7 @@ if not OCR_AVAILABLE:
 # small helper so we don't repeat the same ChatGoogleGenerativeAI setup everywhere
 def get_gemini_model():
     return ChatGoogleGenerativeAI(
-        model="gemini-3.5-flash-lite",
+        model="gemini-1.5-flash",
         google_api_key=GEMINI_API_KEY,
         temperature=0.7
     )
@@ -332,8 +332,17 @@ with tab_import:
         try:
             if bank_file.name.lower().endswith(".csv"):
                 bank_df = pd.read_csv(bank_file)
+            elif bank_file.name.lower().endswith(".xls"):
+                bank_df = pd.read_excel(bank_file, engine="xlrd")
             else:
-                bank_df = pd.read_excel(bank_file)
+                bank_df = pd.read_excel(bank_file, engine="openpyxl")
+        except ImportError as e:
+            bank_df = None
+            st.error(
+                "Missing a required Excel engine package: " + str(e) +
+                "\n\nRun `pip install openpyxl` (for .xlsx) or `pip install xlrd` (for .xls), "
+                "then restart the app and re-upload."
+            )
         except Exception as e:
             bank_df = None
             st.error("couldn't read that file: " + str(e))
