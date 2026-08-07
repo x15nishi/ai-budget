@@ -1,5 +1,6 @@
 streamlit
 pandas
+numpy
 matplotlib
 langchain
 langchain-core
@@ -7,11 +8,9 @@ langchain-google-genai
 python-dotenv
 pillow
 pytesseract
+pdfplumber
+python-docx
+reportlab
 openpyxl
-
-# NOTE: pytesseract is just a Python wrapper - it needs the actual Tesseract OCR
-# engine installed on the machine separately (it's not a pip-installable binary):
-#   Ubuntu/Debian:  sudo apt-get install tesseract-ocr
-#   macOS:          brew install tesseract
-#   Windows:        https://github.com/UB-Mannheim/tesseract/wiki
-# openpyxl is needed so pandas can read .xlsx bank statement exports.
+xlrd
+lxml
