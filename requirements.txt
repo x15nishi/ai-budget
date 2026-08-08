@@ -5,3 +5,8 @@ langchain
 langchain-core
 langchain-google-genai
 python-dotenv
+openpyxl
+xlrd
+pdfplumber
+python-docx
+lxml
