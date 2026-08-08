@@ -25,20 +25,6 @@ try:
 except Exception:
     OCR_AVAILABLE = False
 
-# PDF table extraction - optional, only needed for PDF bank statements
-try:
-    import pdfplumber
-    PDF_AVAILABLE = True
-except Exception:
-    PDF_AVAILABLE = False
-
-# DOCX table extraction - optional, only needed for Word bank statements
-try:
-    import docx  # python-docx
-    DOCX_AVAILABLE = True
-except Exception:
-    DOCX_AVAILABLE = False
-
 load_dotenv()
 
 DATA_FILE = "data.csv"
@@ -105,31 +91,48 @@ else:
 
 if not OCR_AVAILABLE:
     st.sidebar.warning(
-        "OCR libraries not found (pillow / pytesseract), or the tesseract "
-        "binary isn't installed on this machine. Receipt scanning will be "
-        "disabled until that's fixed. See requirements.txt for setup notes."
+        "OCR libraries not found (pillow / pytesseract not installed via pip). "
+        "Run: pip install pillow pytesseract"
     )
 else:
-    # tesseract is a separate binary from the pytesseract python package - on
-    # Windows especially, "pip install" succeeding does NOT mean the binary is
-    # on PATH. This lets you point pytesseract straight at the .exe as a
-    # fallback if "OCR failed: tesseract is not installed or it's not in your
-    # PATH" keeps showing up even after installing it.
-    with st.sidebar.expander("⚙️ OCR settings (only if receipt scan keeps failing)"):
+    with st.sidebar.expander("🔧 OCR (Tesseract) setup"):
         st.caption(
-            "If you installed Tesseract but still get a 'not in PATH' error, "
-            "paste the full path to tesseract.exe here. Typical Windows path: "
-            r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+            "pytesseract is just a Python wrapper - it calls the separate "
+            "Tesseract OCR program. If that program isn't installed, or isn't "
+            "on your system PATH, OCR will fail even though pytesseract "
+            "imported fine."
         )
-        manual_tess_path = st.text_input("Tesseract binary path (optional)", value="", key="tess_path")
-        if manual_tess_path.strip():
-            pytesseract.pytesseract.tesseract_cmd = manual_tess_path.strip()
+        manual_path = st.text_input(
+            "Tesseract executable path (only needed if auto-detect fails)",
+            value=st.session_state.get("tesseract_cmd_path", ""),
+            placeholder=r"e.g. C:\Program Files\Tesseract-OCR\tesseract.exe",
+            key="tesseract_cmd_path",
+        )
+        if manual_path:
+            pytesseract.pytesseract.tesseract_cmd = manual_path
+
+        if st.button("Test OCR setup"):
+            try:
+                version = pytesseract.get_tesseract_version()
+                st.success(f"Tesseract found - version {version}")
+            except Exception as e:
+                st.error(
+                    "Tesseract engine not found. This means the Python package "
+                    "is installed, but the actual OCR program isn't. Install it:\n\n"
+                    "- Windows: download from "
+                    "https://github.com/UB-Mannheim/tesseract/wiki, then paste "
+                    "the full path to tesseract.exe above (commonly "
+                    r"C:\Program Files\Tesseract-OCR\tesseract.exe)"
+                    "\n- Mac: `brew install tesseract`\n"
+                    "- Linux: `sudo apt-get install tesseract-ocr`\n\n"
+                    f"Raw error: {e}"
+                )
 
 
 # small helper so we don't repeat the same ChatGoogleGenerativeAI setup everywhere
 def get_gemini_model():
     return ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash",
+        model="gemini-3.5-flash-lite",
         google_api_key=GEMINI_API_KEY,
         temperature=0.7
     )
@@ -295,9 +298,16 @@ with tab_import:
             with st.spinner("reading receipt..."):
                 try:
                     ocr_text = pytesseract.image_to_string(img)
+                except pytesseract.TesseractNotFoundError:
+                    ocr_text = ""
+                    st.error(
+                        "Tesseract engine isn't installed / found on this machine. "
+                        "Open '🔧 OCR (Tesseract) setup' in the sidebar to install it "
+                        "or point to the executable manually, then re-upload the image."
+                    )
                 except Exception as e:
                     ocr_text = ""
-                    st.error("OCR failed: " + str(e))
+                    st.error("OCR failed: " + repr(e))
 
             # try to guess the total amount - look for a "total" line first,
             # fall back to the largest rupee-looking number on the receipt
@@ -353,140 +363,42 @@ with tab_import:
 
     st.write("---")
     st.subheader("🏦 Import from Bank Statement")
-    st.caption("upload your statement as CSV, Excel (.xls/.xlsx), XML, or PDF - map the columns, and bulk-add transactions")
+    st.caption("upload a CSV/Excel export of your bank statement, map the columns, and bulk-add transactions")
 
-    # ---- robust reader: bank "excel" exports are frequently NOT what their
-    # extension claims. Very common in India: a bank labels a file .xls but it's
-    # actually an HTML table, or labels it .xlsx but it's actually old OLE .xls.
-    # We try several strategies in order rather than trusting the extension.
-    def read_bank_statement(uploaded_file):
-        """Returns (dataframe_or_None, list_of_extra_tables_or_None, error_message_or_None).
-        extra_tables is only populated for PDFs with multiple tables, so the
-        caller can let the user pick which table is the real transaction list."""
-        name = uploaded_file.name.lower()
-        raw = uploaded_file.read()
-        buf = io.BytesIO(raw)
-
-        # ---------- CSV ----------
-        if name.endswith(".csv"):
-            for enc in ["utf-8", "utf-8-sig", "latin-1"]:
-                try:
-                    buf.seek(0)
-                    return pd.read_csv(buf, encoding=enc), None, None
-                except Exception:
-                    continue
-            return None, None, "Could not parse this CSV with common encodings."
-
-        # ---------- XML ----------
-        if name.endswith(".xml"):
-            try:
-                buf.seek(0)
-                return pd.read_xml(buf), None, None
-            except Exception as e:
-                return None, None, f"Could not parse XML: {e}"
-
-        # ---------- XLSX / XLS (try real formats first, then HTML-in-disguise) ----------
-        if name.endswith((".xlsx", ".xls")):
-            # try as real xlsx (zip-based)
-            try:
-                buf.seek(0)
-                return pd.read_excel(buf, engine="openpyxl"), None, None
-            except Exception:
-                pass
-            # try as real legacy xls (OLE-based) - needs xlrd
-            try:
-                buf.seek(0)
-                return pd.read_excel(buf, engine="xlrd"), None, None
-            except ImportError:
-                pass
-            except Exception:
-                pass
-            # try as HTML table wearing an Excel extension (very common bank export)
-            try:
-                buf.seek(0)
-                tables = pd.read_html(buf)
-                if tables:
-                    # usually the largest table is the actual transaction list
-                    tables.sort(key=len, reverse=True)
-                    return tables[0], tables if len(tables) > 1 else None, None
-            except Exception:
-                pass
-            return None, None, (
-                "This file's contents don't match a real .xlsx, .xls, or HTML-based "
-                "export. Try re-exporting from your bank as CSV instead - it's the "
-                "most reliable format."
-            )
-
-        # ---------- PDF ----------
-        if name.endswith(".pdf"):
-            if not PDF_AVAILABLE:
-                return None, None, "PDF support needs `pdfplumber` - run `pip install pdfplumber` and restart."
-            try:
-                buf.seek(0)
-                all_tables = []
-                with pdfplumber.open(buf) as pdf:
-                    for page in pdf.pages:
-                        for tbl in page.extract_tables():
-                            if tbl and len(tbl) > 1:
-                                df_t = pd.DataFrame(tbl[1:], columns=tbl[0])
-                                all_tables.append(df_t)
-                if not all_tables:
-                    return None, None, (
-                        "No tables detected in this PDF. If it's a scanned/image PDF "
-                        "rather than a text-based statement, table extraction won't work - "
-                        "export as CSV/Excel from your bank instead."
-                    )
-                all_tables.sort(key=len, reverse=True)
-                return all_tables[0], all_tables if len(all_tables) > 1 else None, None
-            except Exception as e:
-                return None, None, f"Could not parse PDF: {e}"
-
-        # ---------- DOCX ----------
-        if name.endswith(".docx"):
-            if not DOCX_AVAILABLE:
-                return None, None, "DOCX support needs `python-docx` - run `pip install python-docx` and restart."
-            try:
-                buf.seek(0)
-                d = docx.Document(buf)
-                all_tables = []
-                for t in d.tables:
-                    rows = [[cell.text for cell in row.cells] for row in t.rows]
-                    if len(rows) > 1:
-                        all_tables.append(pd.DataFrame(rows[1:], columns=rows[0]))
-                if not all_tables:
-                    return None, None, "No tables found in this .docx file."
-                all_tables.sort(key=len, reverse=True)
-                return all_tables[0], all_tables if len(all_tables) > 1 else None, None
-            except Exception as e:
-                return None, None, f"Could not parse DOCX: {e}"
-
-        # ---------- old-style .doc (binary, pre-2007 Word) ----------
-        if name.endswith(".doc"):
-            return None, None, (
-                "Old-format .doc files aren't supported directly - they use a binary "
-                "format with no reliable pure-Python reader. Please save/export the "
-                "statement as .docx, .pdf, or .csv from Word and re-upload."
-            )
-
-        return None, None, "Unsupported file type."
-
-    bank_file = st.file_uploader(
-        "Upload bank statement (CSV, Excel, XML, PDF, or DOCX)",
-        type=["csv", "xlsx", "xls", "xml", "pdf", "docx"],
-        key="bank_uploader"
-    )
+    bank_file = st.file_uploader("Upload bank statement (CSV or Excel)", type=["csv", "xlsx", "xls"], key="bank_uploader")
 
     if bank_file is not None:
-        bank_df, extra_tables, err = read_bank_statement(bank_file)
-        if err:
-            st.error(err)
+        skip_rows = st.number_input(
+            "Rows to skip before the header (increase this if the preview below looks wrong / empty - "
+            "most bank exports have a few info rows like account number, statement period, etc. "
+            "before the real column headers)",
+            min_value=0, max_value=50, value=0, step=1, key="bank_skip_rows"
+        )
 
-        if extra_tables:
-            st.info(f"Found {len(extra_tables)} tables in this file - showing the largest one below. "
-                     "If it's the wrong one, re-export a cleaner file with just the transaction table.")
+        bank_df = None
+        try:
+            if bank_file.name.lower().endswith(".csv"):
+                bank_df = pd.read_csv(bank_file, skiprows=skip_rows)
+            else:
+                bank_df = pd.read_excel(bank_file, skiprows=skip_rows)
+        except Exception as e:
+            st.error("couldn't read that file:")
+            st.exception(e)
 
-        if bank_df is not None and not bank_df.empty:
-            st.write("Preview:")
+        if bank_df is not None:
+            # drop fully-empty rows/cols, which bank exports love to include
+            bank_df = bank_df.dropna(axis=0, how="all").dropna(axis=1, how="all")
+
+        if bank_df is None:
+            pass
+        elif bank_df.empty:
+            st.warning(
+                f"The file read fine but produced an empty table (0 usable rows) with "
+                f"{skip_rows} row(s) skipped. Try increasing 'Rows to skip before the header' above, "
+                "or open the file and check where the real transaction table starts."
+            )
+        else:
+            st.write(f"Parsed {len(bank_df)} row(s). Preview:")
             st.dataframe(bank_df.head(), use_container_width=True)
 
             all_cols = list(bank_df.columns)
@@ -507,45 +419,71 @@ with tab_import:
                 if amount_mode != "Single Amount column (+/-)":
                     credit_col = st.selectbox("Credit column", all_cols, key="bank_credit_col")
 
-            # build a normalized transactions table: Description, Amount, Type (Debit/Credit)
-            work = bank_df.copy()
-            if amount_mode == "Single Amount column (+/-)":
-                work["_amount_raw"] = pd.to_numeric(work[amt_col], errors="coerce").fillna(0.0)
-                work["_type"] = work["_amount_raw"].apply(lambda x: "Credit" if x > 0 else "Debit")
-                work["_amount"] = work["_amount_raw"].abs()
-            else:
-                debit_vals = pd.to_numeric(work[debit_col], errors="coerce").fillna(0.0)
-                credit_vals = pd.to_numeric(work[credit_col], errors="coerce").fillna(0.0)
-                work["_amount"] = debit_vals.where(debit_vals > 0, credit_vals)
-                work["_type"] = debit_vals.apply(lambda x: "Debit" if x > 0 else "Credit")
+            try:
+                # build a normalized transactions table: Description, Amount, Type (Debit/Credit)
+                work = bank_df.copy()
+                if amount_mode == "Single Amount column (+/-)":
+                    work["_amount_raw"] = pd.to_numeric(
+                        work[amt_col].astype(str).str.replace(",", "", regex=False).str.replace("₹", "", regex=False).str.strip(),
+                        errors="coerce"
+                    ).fillna(0.0)
+                    work["_type"] = work["_amount_raw"].apply(lambda x: "Credit" if x > 0 else "Debit")
+                    work["_amount"] = work["_amount_raw"].abs()
+                else:
+                    debit_vals = pd.to_numeric(
+                        work[debit_col].astype(str).str.replace(",", "", regex=False).str.replace("₹", "", regex=False).str.strip(),
+                        errors="coerce"
+                    ).fillna(0.0)
+                    credit_vals = pd.to_numeric(
+                        work[credit_col].astype(str).str.replace(",", "", regex=False).str.replace("₹", "", regex=False).str.strip(),
+                        errors="coerce"
+                    ).fillna(0.0)
+                    work["_amount"] = debit_vals.where(debit_vals > 0, credit_vals)
+                    work["_type"] = debit_vals.apply(lambda x: "Debit" if x > 0 else "Credit")
 
-            work["_desc"] = work[desc_col].astype(str)
-            work["_category"] = work["_desc"].apply(categorize_from_text)
-            work.loc[work["_type"] == "Credit", "_category"] = "Income"
+                work["_desc"] = work[desc_col].astype(str)
+                work["_category"] = work["_desc"].apply(categorize_from_text)
+                work.loc[work["_type"] == "Credit", "_category"] = "Income"
 
-            preview = work[["_desc", "_type", "_category", "_amount"]].rename(
-                columns={"_desc": "Description", "_type": "Type", "_category": "Category", "_amount": "Amount"}
-            )
-            st.write("Transactions found (edit categories if needed, then import):")
-            preview_edited = st.data_editor(preview, use_container_width=True, key="bank_preview_editor")
+                preview = work[["_desc", "_type", "_category", "_amount"]].rename(
+                    columns={"_desc": "Description", "_type": "Type", "_category": "Category", "_amount": "Amount"}
+                )
+                # rows where the amount column was blank/non-numeric everywhere would show as 0 - filter those out
+                preview = preview[preview["Amount"] > 0].reset_index(drop=True)
+            except Exception as e:
+                preview = None
+                st.error("couldn't build the transaction table from the columns you picked:")
+                st.exception(e)
 
-            total_debit = preview_edited.loc[preview_edited["Type"] == "Debit", "Amount"].sum()
-            total_credit = preview_edited.loc[preview_edited["Type"] == "Credit", "Amount"].sum()
+            if preview is not None and preview.empty:
+                st.warning(
+                    "No non-zero transactions found with the columns you selected. "
+                    "Double check you picked the right Amount/Debit/Credit column - "
+                    "it should contain numbers, not text."
+                )
+            elif preview is not None:
+                st.write("Transactions found (edit categories if needed, then import):")
+                preview_edited = st.data_editor(preview, use_container_width=True, key="bank_preview_editor")
 
-            st.write(f"Total spending found: **₹{total_debit:,.2f}**  |  Total income found: **₹{total_credit:,.2f}**")
+                total_debit = preview_edited.loc[preview_edited["Type"] == "Debit", "Amount"].sum()
+                total_credit = preview_edited.loc[preview_edited["Type"] == "Credit", "Amount"].sum()
 
-            bi1, bi2 = st.columns(2)
-            with bi1:
-                if st.button("➕ Add all Debit rows as Expenses"):
-                    debit_rows = preview_edited[preview_edited["Type"] == "Debit"]
-                    for _, row in debit_rows.iterrows():
-                        if row["Amount"] > 0:
-                            add_expense_row(row["Category"], row["Description"], row["Amount"])
-                    st.success(f"Added {len(debit_rows)} expense(s) from bank statement")
-            with bi2:
-                if st.button(f"💰 Set Monthly Income to detected credit total (₹{total_credit:,.2f})"):
-                    st.session_state.income_val = float(total_credit)
-                    st.rerun()
+                st.write(f"Total spending found: **₹{total_debit:,.2f}**  |  Total income found: **₹{total_credit:,.2f}**")
+
+                bi1, bi2 = st.columns(2)
+                with bi1:
+                    if st.button("➕ Add all Debit rows as Expenses"):
+                        debit_rows = preview_edited[preview_edited["Type"] == "Debit"]
+                        added = 0
+                        for _, row in debit_rows.iterrows():
+                            if row["Amount"] > 0:
+                                add_expense_row(row["Category"], row["Description"], row["Amount"])
+                                added += 1
+                        st.success(f"Added {added} expense(s) from bank statement")
+                with bi2:
+                    if st.button(f"💰 Set Monthly Income to detected credit total (₹{total_credit:,.2f})"):
+                        st.session_state.income_val = float(total_credit)
+                        st.rerun()
 
 # =========================================================
 # TAB 3 - DASHBOARD
