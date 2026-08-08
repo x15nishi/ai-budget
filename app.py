@@ -101,7 +101,24 @@ def extract_expenses_from_bill(image_bytes, mime_type):
     )
 
     response = model.invoke([message])
-    raw_text = response.content.strip()
+
+    # response.content can be a plain string OR a list of content blocks
+    # (e.g. [{"type": "text", "text": "..."}]) depending on the model/response,
+    # so normalize it to a string first
+    raw_content = response.content
+    if isinstance(raw_content, list):
+        text_parts = []
+        for block in raw_content:
+            if isinstance(block, dict):
+                text_parts.append(block.get("text", ""))
+            else:
+                text_parts.append(str(block))
+        raw_text = "".join(text_parts).strip()
+    else:
+        raw_text = str(raw_content).strip()
+
+    if not raw_text:
+        return []
 
     # gemini sometimes wraps json in ```json ... ``` even when told not to, strip that off
     if raw_text.startswith("```"):
