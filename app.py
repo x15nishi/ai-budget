@@ -291,7 +291,11 @@ with st.sidebar:
     st.divider()
 
     st.markdown("**API Key**")
-    env_key = os.getenv("GEMINI_API_KEY")
+    # checks Streamlit Cloud secrets first (st.secrets), then falls back to .env / local env var
+    try:
+        env_key = st.secrets["GEMINI_API_KEY"]
+    except (KeyError, FileNotFoundError):
+        env_key = os.getenv("GEMINI_API_KEY")
     GEMINI_API_KEY = st.text_input("GEMINI_API_KEY", type="password", value=env_key if env_key else "", label_visibility="collapsed")
 
     if GEMINI_API_KEY:
