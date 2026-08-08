@@ -1,16 +1,8 @@
 streamlit
 pandas
-numpy
 matplotlib
 langchain
 langchain-core
 langchain-google-genai
 python-dotenv
-pillow
-pytesseract
-pdfplumber
-python-docx
-reportlab
-openpyxl
-xlrd
-lxml
+ 
