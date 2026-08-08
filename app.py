@@ -125,13 +125,15 @@ def money(v):
 
 
 def metric_card_html(label, value, sub, accent):
-    return f"""
-    <div class="metric-card" style="--accent:{accent}">
-        <div class="m-label">{label}</div>
-        <div class="m-value">{value}</div>
-        <div class="m-sub">{sub}</div>
-    </div>
-    """
+    # NOTE: no leading whitespace on these lines - Streamlit's markdown parser
+    # treats 4+ space indented lines as a code block, which breaks the HTML render
+    return (
+        f'<div class="metric-card" style="--accent:{accent}">'
+        f'<div class="m-label">{label}</div>'
+        f'<div class="m-value">{value}</div>'
+        f'<div class="m-sub">{sub}</div>'
+        f'</div>'
+    )
 
 
 def render_summary_bar(income, total_exp, balance, savings):
@@ -146,30 +148,32 @@ def render_summary_bar(income, total_exp, balance, savings):
 
 
 def empty_state(icon, title, sub):
-    st.markdown(f"""
-    <div class="empty-state">
-        <div class="icon">{icon}</div>
-        <div class="title">{title}</div>
-        <div>{sub}</div>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="empty-state">'
+        f'<div class="icon">{icon}</div>'
+        f'<div class="title">{title}</div>'
+        f'<div>{sub}</div>'
+        f'</div>',
+        unsafe_allow_html=True
+    )
 
 
 def budget_bar(cat, spent, lim):
     pct = min(spent / lim, 1.0) * 100 if lim > 0 else 0
     color = "#22C55E" if pct < 80 else ("#F59E0B" if pct <= 100 else "#EF4444")
     over = spent > lim
-    st.markdown(f"""
-    <div class="budget-bar-wrap">
-        <div class="budget-bar-label">
-            <span>{cat}</span>
-            <span>{money(spent)} / {money(lim)} {"⚠️" if over else ""}</span>
-        </div>
-        <div class="budget-bar-track">
-            <div class="budget-bar-fill" style="width:{pct}%; background:{color};"></div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="budget-bar-wrap">'
+        f'<div class="budget-bar-label">'
+        f'<span>{cat}</span>'
+        f'<span>{money(spent)} / {money(lim)} {"⚠️" if over else ""}</span>'
+        f'</div>'
+        f'<div class="budget-bar-track">'
+        f'<div class="budget-bar-fill" style="width:{pct}%; background:{color};"></div>'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True
+    )
     if over:
         st.markdown(f'<span class="badge" style="background:#FEE2E2;color:#B91C1C;">{cat} is over budget</span>', unsafe_allow_html=True)
 
@@ -307,10 +311,11 @@ with st.sidebar:
     st.divider()
     st.markdown("**Quick Stats**")
     _total_exp_sb = st.session_state.expenses["Amount"].sum() if not st.session_state.expenses.empty else 0.0
-    st.markdown(f"""
-    <div class="side-stat"><span>Total Expense</span><b>{money(_total_exp_sb)}</b></div>
-    <div class="side-stat"><span>Entries</span><b>{len(st.session_state.expenses)}</b></div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="side-stat"><span>Total Expense</span><b>{money(_total_exp_sb)}</b></div>'
+        f'<div class="side-stat"><span>Entries</span><b>{len(st.session_state.expenses)}</b></div>',
+        unsafe_allow_html=True
+    )
 
     st.divider()
     st.caption("Made with Streamlit + Gemini ✨")
@@ -529,12 +534,12 @@ with tab_dash:
             if total_exp > income:
                 st.error("You are spending more than you earn this month!")
 
-            st.markdown("""
-            - Try to save money as soon as salary comes in
-            - Track small expenses too — they add up
-            - Cancel subscriptions you don't use
-            - Keep some emergency fund
-            """)
+            st.markdown(
+"""- Try to save money as soon as salary comes in
+- Track small expenses too — they add up
+- Cancel subscriptions you don't use
+- Keep some emergency fund"""
+            )
         else:
             st.info("Enter income above to see personalized tips")
 
