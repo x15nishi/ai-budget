@@ -317,6 +317,34 @@ INCOME_SOURCE_KEYWORDS = {
 }
 
 
+def _dedupe_columns(raw_cols):
+    """
+    Makes a list of column names unique (col, col, col -> col, col_1, col_2).
+
+    Bank exports quite often have duplicate/blank header cells (two empty
+    columns, two columns literally both named "Amount", etc). If we leave
+    those duplicate names on the dataframe, doing raw_df[some_name] returns
+    a mini-DataFrame instead of a single Series wherever that name repeats,
+    and assigning that into a single output column later forces pandas to
+    reindex it - which throws "Reindexing only valid with uniquely valued
+    Index objects" because the duplicate names aren't unique. Deduping the
+    names up front avoids that entirely.
+    """
+    seen = {}
+    result = []
+    for c in raw_cols:
+        c = str(c).strip()
+        if c == "" or c.lower() == "nan":
+            c = "col"
+        if c in seen:
+            seen[c] += 1
+            result.append(f"{c}_{seen[c]}")
+        else:
+            seen[c] = 0
+            result.append(c)
+    return result
+
+
 def _find_col(columns, synonyms):
     """finds the real column name that best matches one of our synonym lists"""
     for c in columns:
@@ -351,6 +379,9 @@ def _detect_header_row(raw_no_header_df):
 def normalize_bank_df(raw_df):
     """maps a raw dataframe (any bank's column naming) onto Date/Description/Debit/Credit/Balance"""
     raw_df = raw_df.dropna(axis=1, how="all")
+    # defensive dedupe here too, in case a raw_df reaches this function without
+    # having gone through one of the _load_* helpers below (e.g. future callers)
+    raw_df.columns = _dedupe_columns(raw_df.columns)
     columns = list(raw_df.columns)
 
     date_col = _find_col(columns, DATE_SYNONYMS)
@@ -485,7 +516,7 @@ def _load_csv(uploaded_file):
             if header_row is not None:
                 header = no_header_df.iloc[header_row].tolist()
                 data = no_header_df.iloc[header_row + 1:].reset_index(drop=True)
-                data.columns = header
+                data.columns = _dedupe_columns(header)
                 return data, None
     except Exception:
         pass
@@ -495,6 +526,7 @@ def _load_csv(uploaded_file):
     try:
         raw_df = pd.read_csv(io.StringIO(text))
         if raw_df.shape[1] >= 2:
+            raw_df.columns = _dedupe_columns(raw_df.columns)
             return raw_df, None
     except Exception:
         pass
@@ -511,9 +543,12 @@ def _load_excel(uploaded_file):
         if header_row is not None:
             df = pd.read_excel(xls, sheet_name=sheet, header=header_row)
             if len(df) > 0:
+                df.columns = _dedupe_columns(df.columns)
                 return df, None
     # nothing scored well enough - just use the first sheet as-is
-    return pd.read_excel(xls, sheet_name=xls.sheet_names[0]), None
+    df = pd.read_excel(xls, sheet_name=xls.sheet_names[0])
+    df.columns = _dedupe_columns(df.columns)
+    return df, None
 
 
 def _load_pdf(uploaded_file):
@@ -524,7 +559,7 @@ def _load_pdf(uploaded_file):
             try:
                 for t in page.extract_tables():
                     if t and len(t) >= 2:
-                        table_frames.append(pd.DataFrame(t[1:], columns=t[0]))
+                        table_frames.append(pd.DataFrame(t[1:], columns=_dedupe_columns(t[0])))
             except Exception:
                 pass
             try:
@@ -532,7 +567,9 @@ def _load_pdf(uploaded_file):
             except Exception:
                 pass
     if table_frames:
-        return pd.concat(table_frames, ignore_index=True, sort=False), None
+        combined = pd.concat(table_frames, ignore_index=True, sort=False)
+        combined.columns = _dedupe_columns(combined.columns)
+        return combined, None
     return None, "\n".join(text_parts)
 
 
@@ -543,16 +580,20 @@ def _load_docx(uploaded_file):
     for table in document.tables:
         rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
         if len(rows) >= 2:
-            table_frames.append(pd.DataFrame(rows[1:], columns=rows[0]))
+            table_frames.append(pd.DataFrame(rows[1:], columns=_dedupe_columns(rows[0])))
     if table_frames:
-        return pd.concat(table_frames, ignore_index=True, sort=False), None
+        combined = pd.concat(table_frames, ignore_index=True, sort=False)
+        combined.columns = _dedupe_columns(combined.columns)
+        return combined, None
     text = "\n".join(p.text for p in document.paragraphs)
     return None, text
 
 
 def _load_xml(uploaded_file):
     try:
-        return pd.read_xml(uploaded_file), None
+        df = pd.read_xml(uploaded_file)
+        df.columns = _dedupe_columns(df.columns)
+        return df, None
     except Exception:
         pass
     try:
