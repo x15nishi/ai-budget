@@ -387,9 +387,9 @@ def normalize_bank_df(raw_df):
 
     out["Balance"] = _clean_amount_series(raw_df[balance_col]) if balance_col else pd.NA
 
-    # drop obvious junk rows (no description, no amount at all - usually blank/footer rows)
-    out = out[(out["Debit"] != 0) | (out["Credit"] != 0) | (out["Description"].str.strip() != "")]
-    out = out[~((out["Debit"] == 0) & (out["Credit"] == 0))].reset_index(drop=True)
+    # drop junk rows that have no amount at all (usually blank/footer rows).
+    # a row only counts as real data if it has a non-zero debit or credit.
+    out = out[(out["Debit"] != 0) | (out["Credit"] != 0)].reset_index(drop=True)
     return out
 
 
@@ -444,6 +444,21 @@ def parse_text_fallback(text):
 
 
 def _load_csv(uploaded_file):
+    """
+    Reads a bank-exported CSV.
+
+    IMPORTANT: we deliberately try the header-agnostic parser FIRST, not as a
+    fallback. Real bank CSV exports usually have junk rows above the real
+    header (account title, "A/C No: xxxx", blank lines, etc). A plain
+    pd.read_csv() call happily "succeeds" on these files - it just uses the
+    junk row as the header - so it never raises an exception and the smart
+    detection logic used to never even run. That's what was breaking imports:
+    parse_bank_file() would get a raw_df back with garbage column names,
+    normalize_bank_df() couldn't find Date/Debit/Credit/etc among them and
+    returned None, and there was no fallback_text either (because _load_csv
+    "succeeded"), so parse_bank_file() had nothing to fall back to and
+    reported "Couldn't find any transactions."
+    """
     raw_bytes = uploaded_file.getvalue()
     text = None
     for enc in ("utf-8-sig", "utf-8", "latin-1"):
@@ -455,17 +470,9 @@ def _load_csv(uploaded_file):
     if text is None:
         text = raw_bytes.decode("utf-8", errors="replace")
 
-    try:
-        raw_df = pd.read_csv(io.StringIO(text))
-        if raw_df.shape[1] < 2:
-            raise ValueError("only one column, probably not a clean csv")
-        return raw_df, None
-    except Exception:
-        pass
-
-    # not a clean csv (junk title/account-info rows above the real header, or
-    # ragged row lengths that make pandas' own parser choke) - fall back to
-    # python's csv module, which tolerates uneven row widths, then sniff the header
+    # 1) try robust, header-agnostic parsing FIRST - handles both clean
+    # exports and ones with junk rows above the real header (most Indian
+    # bank CSV exports look like this)
     try:
         import csv as csv_module
         reader = csv_module.reader(io.StringIO(text))
@@ -483,6 +490,16 @@ def _load_csv(uploaded_file):
     except Exception:
         pass
 
+    # 2) fallback: plain pandas read, for clean CSVs that for whatever reason
+    # didn't score high enough on the synonym check above
+    try:
+        raw_df = pd.read_csv(io.StringIO(text))
+        if raw_df.shape[1] >= 2:
+            return raw_df, None
+    except Exception:
+        pass
+
+    # 3) nothing structured worked - hand back raw text for the free-text parser
     return None, text
 
 
