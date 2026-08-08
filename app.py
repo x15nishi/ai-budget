@@ -3,9 +3,12 @@
 # made this to track monthly budget and get AI tips
 
 import os
+import io
+import re
 import json
 import base64
 import urllib.parse
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
@@ -20,8 +23,9 @@ from langchain_core.messages import HumanMessage
 load_dotenv()
 
 DATA_FILE = "data.csv"
-cols = ["Category", "Remark", "Amount"]  # columns for the expense table
+cols = ["Category", "Remark", "Amount", "Date"]  # columns for the expense table
 CATEGORY_OPTIONS = ["Food", "Rent", "Transport", "Shopping", "Entertainment", "Utilities", "Other"]
+INCOME_SOURCE_OPTIONS = ["Salary", "Interest", "Refund", "Dividend", "Other Income"]
 
 # one consistent colour per category, used across the pie/bar charts and the budget bars
 CATEGORY_COLORS = {
@@ -191,11 +195,17 @@ def get_gemini_model():
 def load_expenses():
     try:
         df = pd.read_csv(DATA_FILE)
-        if list(df.columns) != cols:
-            df = pd.DataFrame(columns=cols)
-    except:
+        # older data.csv files (before the Date column was added) only had 3 cols -
+        # just add the missing column instead of nuking their saved data
+        if "Date" not in df.columns:
+            df["Date"] = pd.NaT
+        missing = [c for c in cols if c not in df.columns]
+        if missing or set(df.columns) - set(cols):
+            df = df.reindex(columns=cols)
+    except Exception:
         df = pd.DataFrame(columns=cols)
     df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce").fillna(0.0)
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     return df
 
 
@@ -272,6 +282,364 @@ def extract_expenses_from_bill(image_bytes, mime_type):
 
 
 # =========================================================
+# BANK STATEMENT IMPORT - parsing, EDA & auto-categorization
+# (supports csv, xlsx/xls, pdf, docx, xml, txt - any format a bank export
+# might come in, on a best-effort basis)
+# =========================================================
+
+# column name synonyms used to auto-detect which column is which, since every
+# bank names things differently (e.g. HDFC uses "Narration", SBI uses "Description")
+DATE_SYNONYMS = ["date", "txn date", "transaction date", "value date", "posting date", "tran date"]
+DESC_SYNONYMS = ["description", "narration", "particulars", "details", "remarks", "transaction details", "reference", "remark"]
+DEBIT_SYNONYMS = ["debit", "withdrawal", "withdrawal amt", "withdrawal amount", "dr", "paid out", "amount debited", "debit amount"]
+CREDIT_SYNONYMS = ["credit", "deposit", "deposit amt", "deposit amount", "cr", "paid in", "amount credited", "credit amount"]
+BALANCE_SYNONYMS = ["balance", "closing balance", "available balance", "running balance"]
+AMOUNT_SYNONYMS = ["amount", "txn amount", "transaction amount", "amt"]
+TYPE_SYNONYMS = ["type", "dr/cr", "cr/dr", "transaction type", "indicator"]
+
+SELF_TRANSFER_KEYWORDS = ["self", "own a/c", "own account", "internal transfer", "to self", "imps-self", "fund transfer self", "own acc"]
+CREDIT_HINT_KEYWORDS = ["salary", "credited", "refund", "cashback", "received", "interest", "dividend", "bonus", "reimbursement"]
+
+EXPENSE_CATEGORY_KEYWORDS = {
+    "Food": ["swiggy", "zomato", "restaurant", "dominos", "pizza", "cafe", "food", "dine", "hotel", "mcdonald", "kfc", "starbucks", "haldiram", "eatery", "bakery"],
+    "Rent": ["rent", "landlord", "lease"],
+    "Transport": ["uber", "ola", "irctc", "petrol", "diesel", "fuel", "metro", "rapido", "fastag", "transport", "railway", "indian oil", "bpcl", "hpcl", "parking", "cab"],
+    "Shopping": ["amazon", "flipkart", "myntra", "ajio", "shopping", "mall", "reliance digital", "nykaa", "meesho", "store", "mart"],
+    "Entertainment": ["netflix", "hotstar", "spotify", "bookmyshow", "prime video", "movie", "cinema", "pvr", "inox", "sony liv", "zee5", "gaana"],
+    "Utilities": ["electricity", "recharge", "airtel", "jio", "vodafone", "broadband", "wifi", "gas bill", "water bill", "dth", "utility", "bses", "mtnl", "bsnl", "postpaid", "prepaid"],
+}
+
+INCOME_SOURCE_KEYWORDS = {
+    "Salary": ["salary", "sal credit", "payroll"],
+    "Interest": ["interest", "int.cr", "int cr", "sb int"],
+    "Refund": ["refund", "reversal", "cashback"],
+    "Dividend": ["dividend"],
+}
+
+
+def _find_col(columns, synonyms):
+    """finds the real column name that best matches one of our synonym lists"""
+    for c in columns:
+        cl = str(c).strip().lower()
+        for s in synonyms:
+            if cl == s or (len(s) > 2 and s in cl):
+                return c
+    return None
+
+
+def _clean_amount_series(s):
+    """turns messy amount strings ('₹1,234.50', '(500.00)', 'Rs. 99') into floats"""
+    s = s.astype(str)
+    s = s.str.replace(r"[₹,]|Rs\.?", "", regex=True)
+    s = s.str.replace(r"\((.*)\)", r"-\1", regex=True)  # (500) means -500
+    s = s.str.strip()
+    return pd.to_numeric(s, errors="coerce").fillna(0.0)
+
+
+def _detect_header_row(raw_no_header_df):
+    """scans the first ~20 rows of a headerless sheet/table to guess which row is the real header"""
+    all_syn = DATE_SYNONYMS + DESC_SYNONYMS + DEBIT_SYNONYMS + CREDIT_SYNONYMS + AMOUNT_SYNONYMS + BALANCE_SYNONYMS + TYPE_SYNONYMS
+    best_idx, best_score = None, 0
+    for i in range(min(20, len(raw_no_header_df))):
+        row_vals = [str(v).strip().lower() for v in raw_no_header_df.iloc[i].tolist()]
+        score = sum(1 for v in row_vals for syn in all_syn if v == syn or (len(v) > 2 and syn in v))
+        if score > best_score:
+            best_score, best_idx = score, i
+    return best_idx if best_score >= 2 else None
+
+
+def normalize_bank_df(raw_df):
+    """maps a raw dataframe (any bank's column naming) onto Date/Description/Debit/Credit/Balance"""
+    raw_df = raw_df.dropna(axis=1, how="all")
+    columns = list(raw_df.columns)
+
+    date_col = _find_col(columns, DATE_SYNONYMS)
+    desc_col = _find_col(columns, DESC_SYNONYMS)
+    debit_col = _find_col(columns, DEBIT_SYNONYMS)
+    credit_col = _find_col(columns, CREDIT_SYNONYMS)
+    balance_col = _find_col(columns, BALANCE_SYNONYMS)
+    amount_col = _find_col(columns, AMOUNT_SYNONYMS)
+    type_col = _find_col(columns, TYPE_SYNONYMS)
+
+    if desc_col is None and date_col is None and debit_col is None and credit_col is None and amount_col is None:
+        return None  # doesn't look like a transaction table at all
+
+    out = pd.DataFrame()
+    out["Date"] = pd.to_datetime(raw_df[date_col], errors="coerce", dayfirst=True) if date_col else pd.NaT
+    out["Description"] = raw_df[desc_col].astype(str).str.strip() if desc_col else ""
+
+    if debit_col is not None or credit_col is not None:
+        out["Debit"] = _clean_amount_series(raw_df[debit_col]).abs() if debit_col else 0.0
+        out["Credit"] = _clean_amount_series(raw_df[credit_col]).abs() if credit_col else 0.0
+    elif amount_col is not None:
+        amt = _clean_amount_series(raw_df[amount_col])
+        if type_col is not None:
+            t = raw_df[type_col].astype(str).str.lower()
+            is_debit = t.str.contains("dr") | t.str.contains("debit")
+            out["Debit"] = amt.abs().where(is_debit, 0.0)
+            out["Credit"] = amt.abs().where(~is_debit, 0.0)
+        else:
+            out["Debit"] = amt.where(amt < 0, 0.0).abs()
+            out["Credit"] = amt.where(amt > 0, 0.0)
+    else:
+        out["Debit"] = 0.0
+        out["Credit"] = 0.0
+
+    out["Balance"] = _clean_amount_series(raw_df[balance_col]) if balance_col else pd.NA
+
+    # drop obvious junk rows (no description, no amount at all - usually blank/footer rows)
+    out = out[(out["Debit"] != 0) | (out["Credit"] != 0) | (out["Description"].str.strip() != "")]
+    out = out[~((out["Debit"] == 0) & (out["Credit"] == 0))].reset_index(drop=True)
+    return out
+
+
+DATE_REGEX = r"\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}|\d{4}[\/\-.]\d{1,2}[\/\-.]\d{1,2}"
+AMOUNT_REGEX = r"[-+]?₹?\s?\d[\d,]*\.\d{2}"
+
+
+def parse_text_fallback(text):
+    """
+    best-effort line-by-line extraction for unstructured text (scanned PDFs, plain
+    txt exports, docx with no real table). looks for a date + trailing amount per line.
+    flags every row so the UI can warn the user to double check it.
+    """
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        date_match = re.search(DATE_REGEX, line)
+        amounts = re.findall(AMOUNT_REGEX, line)
+        if not date_match or not amounts:
+            continue
+        date_str = date_match.group(0)
+        amt_str = amounts[-1]
+        desc = line.replace(date_str, "")
+        for a in amounts:
+            desc = desc.replace(a, "")
+        desc = re.sub(r"\s+", " ", desc).strip(" -|,:")
+        amt_val = float(re.sub(r"[₹,\s]", "", amt_str))
+        if amt_val <= 0:
+            continue
+        rows.append({"Date": date_str, "Description": desc if desc else "(unlabelled transaction)", "Amount": amt_val})
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce", dayfirst=True)
+
+    # no reliable debit/credit signal in free text - guess Credit if the description
+    # itself hints at income (salary/refund/etc), else assume Debit (most personal
+    # statement lines are spends). the review table lets the user flip this per row.
+    desc_l = df["Description"].str.lower()
+    is_credit_guess = desc_l.apply(lambda d: any(k in d for k in CREDIT_HINT_KEYWORDS))
+    out = pd.DataFrame()
+    out["Date"] = df["Date"]
+    out["Description"] = df["Description"]
+    out["Debit"] = df["Amount"].where(~is_credit_guess, 0.0)
+    out["Credit"] = df["Amount"].where(is_credit_guess, 0.0)
+    out["Balance"] = pd.NA
+    return out
+
+
+def _load_csv(uploaded_file):
+    raw_bytes = uploaded_file.getvalue()
+    text = None
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            text = raw_bytes.decode(enc)
+            break
+        except Exception:
+            continue
+    if text is None:
+        text = raw_bytes.decode("utf-8", errors="replace")
+
+    try:
+        raw_df = pd.read_csv(io.StringIO(text))
+        if raw_df.shape[1] < 2:
+            raise ValueError("only one column, probably not a clean csv")
+        return raw_df, None
+    except Exception:
+        pass
+
+    # not a clean csv (junk title/account-info rows above the real header, or
+    # ragged row lengths that make pandas' own parser choke) - fall back to
+    # python's csv module, which tolerates uneven row widths, then sniff the header
+    try:
+        import csv as csv_module
+        reader = csv_module.reader(io.StringIO(text))
+        rows = [row for row in reader if any(cell.strip() for cell in row)]
+        if rows:
+            max_cols = max(len(r) for r in rows)
+            rows = [r + [""] * (max_cols - len(r)) for r in rows]
+            no_header_df = pd.DataFrame(rows)
+            header_row = _detect_header_row(no_header_df)
+            if header_row is not None:
+                header = no_header_df.iloc[header_row].tolist()
+                data = no_header_df.iloc[header_row + 1:].reset_index(drop=True)
+                data.columns = header
+                return data, None
+    except Exception:
+        pass
+
+    return None, text
+
+
+def _load_excel(uploaded_file):
+    xls = pd.ExcelFile(uploaded_file)
+    for sheet in xls.sheet_names:
+        no_header = pd.read_excel(xls, sheet_name=sheet, header=None)
+        header_row = _detect_header_row(no_header)
+        if header_row is not None:
+            df = pd.read_excel(xls, sheet_name=sheet, header=header_row)
+            if len(df) > 0:
+                return df, None
+    # nothing scored well enough - just use the first sheet as-is
+    return pd.read_excel(xls, sheet_name=xls.sheet_names[0]), None
+
+
+def _load_pdf(uploaded_file):
+    import pdfplumber
+    table_frames, text_parts = [], []
+    with pdfplumber.open(uploaded_file) as pdf:
+        for page in pdf.pages:
+            try:
+                for t in page.extract_tables():
+                    if t and len(t) >= 2:
+                        table_frames.append(pd.DataFrame(t[1:], columns=t[0]))
+            except Exception:
+                pass
+            try:
+                text_parts.append(page.extract_text() or "")
+            except Exception:
+                pass
+    if table_frames:
+        return pd.concat(table_frames, ignore_index=True, sort=False), None
+    return None, "\n".join(text_parts)
+
+
+def _load_docx(uploaded_file):
+    import docx
+    document = docx.Document(uploaded_file)
+    table_frames = []
+    for table in document.tables:
+        rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
+        if len(rows) >= 2:
+            table_frames.append(pd.DataFrame(rows[1:], columns=rows[0]))
+    if table_frames:
+        return pd.concat(table_frames, ignore_index=True, sort=False), None
+    text = "\n".join(p.text for p in document.paragraphs)
+    return None, text
+
+
+def _load_xml(uploaded_file):
+    try:
+        return pd.read_xml(uploaded_file), None
+    except Exception:
+        pass
+    try:
+        import xml.etree.ElementTree as ET
+        raw_bytes = uploaded_file.getvalue()
+        root = ET.fromstring(raw_bytes)
+        rows = []
+        for child in root.iter():
+            grandchildren = list(child)
+            if grandchildren and all(len(list(gc)) == 0 for gc in grandchildren):
+                row = {gc.tag: (gc.text or "").strip() for gc in grandchildren}
+                if row:
+                    rows.append(row)
+        if rows:
+            return pd.DataFrame(rows), None
+        return None, raw_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        raw_bytes = uploaded_file.getvalue()
+        return None, raw_bytes.decode("utf-8", errors="replace")
+
+
+def classify_type(description, debit, credit, ambiguous=False):
+    desc_l = str(description).lower()
+    if any(k in desc_l for k in SELF_TRANSFER_KEYWORDS):
+        return "Self Transfer"
+    if ambiguous:
+        return "Income" if any(k in desc_l for k in CREDIT_HINT_KEYWORDS) else "Expense"
+    if credit > 0 and debit == 0:
+        return "Income"
+    if debit > 0 and credit == 0:
+        return "Expense"
+    return "Income" if credit >= debit else "Expense"
+
+
+def classify_category(description, type_):
+    desc_l = str(description).lower()
+    if type_ == "Self Transfer":
+        return "Self Transfer"
+    if type_ == "Income":
+        for src, kws in INCOME_SOURCE_KEYWORDS.items():
+            if any(k in desc_l for k in kws):
+                return src
+        return "Other Income"
+    for cat, kws in EXPENSE_CATEGORY_KEYWORDS.items():
+        if any(k in desc_l for k in kws):
+            return cat
+    return "Other"
+
+
+def parse_bank_file(uploaded_file):
+    """
+    main entry point: reads any supported bank statement file and returns
+    (review_df, mode) where review_df has Date/Description/Amount/Type/Category
+    and mode is 'table' (clean structured parse) or 'text' (best-effort fallback)
+    """
+    name = uploaded_file.name.lower()
+    ext = name.rsplit(".", 1)[-1] if "." in name else ""
+
+    raw_df, fallback_text = None, None
+
+    if ext == "csv":
+        raw_df, fallback_text = _load_csv(uploaded_file)
+    elif ext in ("xlsx", "xls"):
+        raw_df, fallback_text = _load_excel(uploaded_file)
+    elif ext == "pdf":
+        raw_df, fallback_text = _load_pdf(uploaded_file)
+    elif ext == "docx":
+        raw_df, fallback_text = _load_docx(uploaded_file)
+    elif ext == "xml":
+        raw_df, fallback_text = _load_xml(uploaded_file)
+    elif ext == "txt":
+        fallback_text = uploaded_file.getvalue().decode("utf-8", errors="replace")
+    else:
+        raise ValueError(f"unsupported file type: .{ext}")
+
+    norm, mode = None, "table"
+    if raw_df is not None:
+        norm = normalize_bank_df(raw_df)
+
+    if (norm is None or norm.empty) and fallback_text:
+        norm = parse_text_fallback(fallback_text)
+        mode = "text"
+
+    if norm is None or norm.empty:
+        return pd.DataFrame(columns=["Date", "Description", "Amount", "Type", "Category"]), "empty"
+
+    ambiguous = (mode == "text")
+    review_rows = []
+    for _, r in norm.iterrows():
+        debit, credit = float(r["Debit"]), float(r["Credit"])
+        t = classify_type(r["Description"], debit, credit, ambiguous=ambiguous)
+        c = classify_category(r["Description"], t)
+        review_rows.append({
+            "Date": r["Date"],
+            "Description": r["Description"] if str(r["Description"]).strip() else "(no description)",
+            "Amount": debit if debit > 0 else credit,
+            "Type": t,
+            "Category": c,
+        })
+    review_df = pd.DataFrame(review_rows)
+    return review_df, mode
+
+
+# =========================================================
 # SESSION STATE
 # =========================================================
 if "expenses" not in st.session_state:
@@ -285,6 +653,18 @@ if "budgets" not in st.session_state:
 
 if "scanned_items" not in st.session_state:
     st.session_state.scanned_items = pd.DataFrame(columns=cols)
+
+if "income_entries" not in st.session_state:
+    st.session_state.income_entries = pd.DataFrame(columns=["Date", "Source", "Remark", "Amount"])
+
+if "transfers" not in st.session_state:
+    st.session_state.transfers = pd.DataFrame(columns=["Date", "Description", "Amount"])
+
+if "bank_import_preview" not in st.session_state:
+    st.session_state.bank_import_preview = None
+
+if "bank_import_mode" not in st.session_state:
+    st.session_state.bank_import_mode = None
 
 # =========================================================
 # SIDEBAR
@@ -311,9 +691,11 @@ with st.sidebar:
     st.divider()
     st.markdown("**Quick Stats**")
     _total_exp_sb = st.session_state.expenses["Amount"].sum() if not st.session_state.expenses.empty else 0.0
+    _total_inc_imported_sb = st.session_state.income_entries["Amount"].sum() if not st.session_state.income_entries.empty else 0.0
     st.markdown(
         f'<div class="side-stat"><span>Total Expense</span><b>{money(_total_exp_sb)}</b></div>'
-        f'<div class="side-stat"><span>Entries</span><b>{len(st.session_state.expenses)}</b></div>',
+        f'<div class="side-stat"><span>Entries</span><b>{len(st.session_state.expenses)}</b></div>'
+        f'<div class="side-stat"><span>Imported Income</span><b>{money(_total_inc_imported_sb)}</b></div>',
         unsafe_allow_html=True
     )
 
@@ -333,15 +715,22 @@ st.markdown("""
 # ---------------- INCOME ----------------
 with st.container(border=True):
     st.markdown('<div class="section-title">💵 Monthly Income</div>', unsafe_allow_html=True)
-    income = st.number_input("Enter Monthly Income (₹)", min_value=0.0, step=500.0, label_visibility="collapsed")
+    base_income = st.number_input("Enter Monthly Income (₹)", min_value=0.0, step=500.0, label_visibility="collapsed")
+    _imported_income = st.session_state.income_entries["Amount"].sum() if not st.session_state.income_entries.empty else 0.0
+    if _imported_income > 0:
+        st.caption(f"+ {money(_imported_income)} from imported bank statement income → total counted below")
+
+# income used everywhere else in the app = manual entry + whatever got imported
+# from bank statements (salary/interest/refund rows etc)
+income = base_income + _imported_income
 
 # persistent summary, visible no matter which tab is open
 _total_exp_top = st.session_state.expenses["Amount"].sum() if not st.session_state.expenses.empty else 0.0
 render_summary_bar(income, _total_exp_top, income - _total_exp_top, income - _total_exp_top)
 
 # using tabs so everything doesnt look like one giant scrolling page
-tab_add, tab_dash, tab_forecast, tab_advisor, tab_chat, tab_share = st.tabs(
-    ["➕ Add Expense", "📊 Dashboard", "📈 Forecast", "🤖 AI Advisor", "💬 Chat", "📤 Share/Export"]
+tab_add, tab_import, tab_dash, tab_forecast, tab_advisor, tab_chat, tab_share = st.tabs(
+    ["➕ Add Expense", "📥 Import Statement", "📊 Dashboard", "📈 Forecast", "🤖 AI Advisor", "💬 Chat", "📤 Share/Export"]
 )
 
 # =========================================================
@@ -371,7 +760,7 @@ with tab_add:
             final_cat = custom_cat.strip() if category == "Other" and custom_cat.strip() != "" else category
 
             if amount > 0:
-                new_row = pd.DataFrame([{"Category": final_cat, "Remark": remark, "Amount": amount}])
+                new_row = pd.DataFrame([{"Category": final_cat, "Remark": remark, "Amount": amount, "Date": pd.Timestamp.now().normalize()}])
                 st.session_state.expenses = pd.concat([st.session_state.expenses, new_row], ignore_index=True)
                 st.session_state.expenses["Amount"] = pd.to_numeric(st.session_state.expenses["Amount"], errors="coerce").fillna(0.0)
                 save_expenses(st.session_state.expenses)
@@ -410,7 +799,9 @@ with tab_add:
                                 if not extracted:
                                     st.warning("Couldn't read any expense lines from this image — try a clearer photo")
                                 else:
-                                    st.session_state.scanned_items = pd.DataFrame(extracted)
+                                    scanned_df = pd.DataFrame(extracted)
+                                    scanned_df["Date"] = pd.Timestamp.now().normalize()
+                                    st.session_state.scanned_items = scanned_df
                                     st.success(f"Found {len(extracted)} item(s) — review below before adding")
                             except json.JSONDecodeError:
                                 st.error("AI didn't return clean data, try scanning again or use a clearer photo")
@@ -474,6 +865,161 @@ with tab_add:
                 st.session_state.budgets[cat] = st.number_input(cat + " Limit", min_value=0.0, step=500.0, key="lim_" + cat)
 
 # =========================================================
+# TAB - IMPORT BANK STATEMENT
+# =========================================================
+with tab_import:
+    with st.container(border=True):
+        st.markdown('<div class="section-title">📥 Upload Bank Statement</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-caption">CSV, Excel, PDF, Word (.docx), XML or plain text - we auto-detect income, expenses & self-transfers</div>', unsafe_allow_html=True)
+
+        uploaded_stmt = st.file_uploader(
+            "Upload statement", type=["csv", "xlsx", "xls", "pdf", "docx", "xml", "txt"],
+            key="bank_stmt_upload", label_visibility="collapsed"
+        )
+
+        if uploaded_stmt is not None and st.button("🔍 Analyze Statement", use_container_width=True):
+            with st.spinner("Reading & analyzing your statement..."):
+                try:
+                    review_df, mode = parse_bank_file(uploaded_stmt)
+                    if review_df.empty:
+                        st.error("Couldn't find any transactions in this file. A CSV or Excel export from your bank usually parses most reliably.")
+                        st.session_state.bank_import_preview = None
+                    else:
+                        st.session_state.bank_import_preview = review_df
+                        st.session_state.bank_import_mode = mode
+                        st.success(f"Found {len(review_df)} transaction(s)")
+                        if mode == "text":
+                            st.warning("Couldn't detect a clean table in this file — used best-effort text extraction. Please double-check Type / Category / Amount below before importing.")
+                except ValueError as e:
+                    st.error(str(e))
+                except ImportError:
+                    st.error("A required library for this file type isn't installed. Make sure requirements.txt includes pdfplumber / python-docx / openpyxl / lxml.")
+                except Exception as e:
+                    st.error(f"Couldn't read this file: {e}")
+
+    preview = st.session_state.bank_import_preview
+    if preview is not None and not preview.empty:
+        # ---------------- QUICK EDA ----------------
+        with st.container(border=True):
+            st.markdown('<div class="section-title">🔎 Quick EDA</div>', unsafe_allow_html=True)
+
+            total_credit = preview.loc[preview["Type"] == "Income", "Amount"].sum()
+            total_debit = preview.loc[preview["Type"] == "Expense", "Amount"].sum()
+            n_self = int((preview["Type"] == "Self Transfer").sum())
+            valid_dates = pd.to_datetime(preview["Date"], errors="coerce").dropna()
+            date_range_str = f"{valid_dates.min().date()} → {valid_dates.max().date()}" if len(valid_dates) else "unknown"
+
+            e1, e2, e3, e4 = st.columns(4)
+            e1.markdown(metric_card_html("Transactions", str(len(preview)), date_range_str, "#4F46E5"), unsafe_allow_html=True)
+            e2.markdown(metric_card_html("Total Credit", money(total_credit), "detected income", "#22C55E"), unsafe_allow_html=True)
+            e3.markdown(metric_card_html("Total Debit", money(total_debit), "detected expense", "#EF4444"), unsafe_allow_html=True)
+            e4.markdown(metric_card_html("Self Transfers", str(n_self), "excluded from totals", "#64748B"), unsafe_allow_html=True)
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            if len(valid_dates) >= 2:
+                tmp = preview.dropna(subset=["Date"]).copy()
+                tmp["Date"] = pd.to_datetime(tmp["Date"], errors="coerce")
+                tmp = tmp.dropna(subset=["Date"])
+                tmp["Month"] = tmp["Date"].dt.to_period("M").astype(str)
+                monthly = tmp[tmp["Type"] != "Self Transfer"].groupby(["Month", "Type"])["Amount"].sum().reset_index()
+                if not monthly.empty:
+                    fig_m = px.bar(monthly, x="Month", y="Amount", color="Type", barmode="group",
+                                    color_discrete_map={"Income": "#22C55E", "Expense": "#EF4444"})
+                    fig_m.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=300, plot_bgcolor="white")
+                    st.plotly_chart(fig_m, use_container_width=True)
+
+            exp_only = preview[preview["Type"] == "Expense"]
+            if not exp_only.empty:
+                cat_prev = exp_only.groupby("Category")["Amount"].sum().reset_index().sort_values("Amount", ascending=False)
+                fig_c = px.bar(cat_prev, x="Amount", y="Category", orientation="h", color="Category",
+                                color_discrete_map=CATEGORY_COLORS)
+                fig_c.update_layout(showlegend=False, margin=dict(t=10, b=10, l=10, r=10), height=280,
+                                     xaxis_title=None, yaxis_title=None, plot_bgcolor="white")
+                st.plotly_chart(fig_c, use_container_width=True)
+
+        # ---------------- REVIEW & EDIT ----------------
+        with st.container(border=True):
+            st.markdown('<div class="section-title">✏️ Review & Correct</div>', unsafe_allow_html=True)
+            st.markdown('<div class="section-caption">We auto-detected Type and Category from each description — fix anything that looks off before importing</div>', unsafe_allow_html=True)
+
+            all_category_options = sorted(set(CATEGORY_OPTIONS + INCOME_SOURCE_OPTIONS + ["Self Transfer"]))
+            edited_preview = st.data_editor(
+                preview,
+                use_container_width=True,
+                num_rows="dynamic",
+                column_config={
+                    "Type": st.column_config.SelectboxColumn("Type", options=["Income", "Expense", "Self Transfer"]),
+                    "Category": st.column_config.SelectboxColumn("Category", options=all_category_options),
+                    "Amount": st.column_config.NumberColumn("Amount", min_value=0.0, format="₹%.2f"),
+                    "Date": st.column_config.DateColumn("Date"),
+                },
+                key="bank_import_editor",
+            )
+
+            ic1, ic2 = st.columns(2)
+            with ic1:
+                if st.button("✅ Import These Transactions", use_container_width=True):
+                    edited = edited_preview.copy()
+                    edited["Amount"] = pd.to_numeric(edited["Amount"], errors="coerce").fillna(0.0)
+                    edited = edited[edited["Amount"] > 0]
+
+                    exp_rows = edited[edited["Type"] == "Expense"]
+                    inc_rows = edited[edited["Type"] == "Income"]
+                    self_rows = edited[edited["Type"] == "Self Transfer"]
+
+                    if not exp_rows.empty:
+                        new_exp = pd.DataFrame({
+                            "Category": exp_rows["Category"],
+                            "Remark": exp_rows["Description"],
+                            "Amount": exp_rows["Amount"],
+                            "Date": exp_rows["Date"],
+                        })
+                        st.session_state.expenses = pd.concat([st.session_state.expenses, new_exp], ignore_index=True)
+                        st.session_state.expenses["Amount"] = pd.to_numeric(st.session_state.expenses["Amount"], errors="coerce").fillna(0.0)
+                        save_expenses(st.session_state.expenses)
+
+                    if not inc_rows.empty:
+                        new_inc = pd.DataFrame({
+                            "Date": inc_rows["Date"],
+                            "Source": inc_rows["Category"],
+                            "Remark": inc_rows["Description"],
+                            "Amount": inc_rows["Amount"],
+                        })
+                        st.session_state.income_entries = pd.concat([st.session_state.income_entries, new_inc], ignore_index=True)
+
+                    if not self_rows.empty:
+                        new_self = pd.DataFrame({
+                            "Date": self_rows["Date"],
+                            "Description": self_rows["Description"],
+                            "Amount": self_rows["Amount"],
+                        })
+                        st.session_state.transfers = pd.concat([st.session_state.transfers, new_self], ignore_index=True)
+
+                    st.session_state.bank_import_preview = None
+                    st.toast(f"Imported {len(exp_rows)} expense(s), {len(inc_rows)} income(s), {len(self_rows)} self-transfer(s)", icon="🎉")
+                    st.rerun()
+            with ic2:
+                if st.button("❌ Discard", use_container_width=True):
+                    st.session_state.bank_import_preview = None
+                    st.rerun()
+    else:
+        empty_state("📥", "Upload a bank statement", "CSV, Excel, PDF, Word or XML — we'll auto-detect income, expenses & self-transfers")
+
+    if not st.session_state.income_entries.empty:
+        with st.expander(f"💰 {len(st.session_state.income_entries)} imported income entry/entries (added to Monthly Income above)"):
+            st.dataframe(st.session_state.income_entries, use_container_width=True)
+            if st.button("🗑️ Clear Imported Income", key="clear_income_entries"):
+                st.session_state.income_entries = pd.DataFrame(columns=["Date", "Source", "Remark", "Amount"])
+                st.rerun()
+
+    if not st.session_state.transfers.empty:
+        with st.expander(f"🔁 {len(st.session_state.transfers)} self-transfer(s) logged (excluded from income/expense totals)"):
+            st.dataframe(st.session_state.transfers, use_container_width=True)
+            if st.button("🗑️ Clear Transfer Log", key="clear_transfers"):
+                st.session_state.transfers = pd.DataFrame(columns=["Date", "Description", "Amount"])
+                st.rerun()
+
+# =========================================================
 # TAB 2 - DASHBOARD
 # =========================================================
 with tab_dash:
@@ -513,6 +1059,19 @@ with tab_dash:
                     if lim > 0:
                         spent = st.session_state.expenses.loc[st.session_state.expenses["Category"] == cat, "Amount"].sum()
                         budget_bar(cat, spent, lim)
+
+        _dated = st.session_state.expenses.dropna(subset=["Date"]) if "Date" in st.session_state.expenses.columns else pd.DataFrame()
+        if len(_dated) >= 2:
+            with st.container(border=True):
+                st.markdown('<div class="section-title">📅 Spending Trend</div>', unsafe_allow_html=True)
+                st.markdown('<div class="section-caption">By day, across manually added, scanned & imported expenses</div>', unsafe_allow_html=True)
+                trend = _dated.copy()
+                trend["Date"] = pd.to_datetime(trend["Date"], errors="coerce")
+                trend = trend.dropna(subset=["Date"]).groupby(trend["Date"].dt.date)["Amount"].sum().reset_index()
+                fig_t = px.line(trend, x="Date", y="Amount", markers=True)
+                fig_t.update_traces(line=dict(color="#4F46E5", width=3), marker=dict(size=6, color="#4F46E5"))
+                fig_t.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=280, plot_bgcolor="white", yaxis_title="₹")
+                st.plotly_chart(fig_t, use_container_width=True)
     else:
         with st.container(border=True):
             empty_state("📊", "Nothing to chart yet", "Add some expenses in the Add Expense tab first")
