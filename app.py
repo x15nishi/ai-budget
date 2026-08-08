@@ -1,11 +1,10 @@
 # AI Personal Budget Planner
 # Mini Project - Python + Streamlit + Gemini API (via LangChain)
 # made this to track monthly budget and get AI tips
-# v2: added OCR receipt scanning, bank statement import, and a nicer share/export tab
 
 import os
-import re
-import io
+import json
+import base64
 import urllib.parse
 
 import pandas as pd
@@ -15,63 +14,20 @@ from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-
-# OCR deps are optional at runtime - if tesseract binary isn't installed on the
-# machine, we still want the rest of the app to work, so we fail soft.
-try:
-    from PIL import Image
-    import pytesseract
-    OCR_AVAILABLE = True
-except Exception:
-    OCR_AVAILABLE = False
+from langchain_core.messages import HumanMessage
 
 load_dotenv()
 
 DATA_FILE = "data.csv"
 cols = ["Category", "Remark", "Amount"]  # columns for the expense table
+CATEGORY_OPTIONS = ["Food", "Rent", "Transport", "Shopping", "Entertainment", "Utilities", "Other"]
 
 st.set_page_config(page_title="AI Personal Budget Planner", layout="wide", page_icon="💰")
 
 # little bit of css just to make metric boxes look nice, took this from streamlit forum
-# + a bit more css for the share buttons at the bottom
 st.markdown("""
 <style>
 .stMetric {background-color:#F5F7FA; padding:10px; border-radius:10px;}
-
-.share-btn {
-    display:flex;
-    align-items:center;
-    justify-content:center;
-    gap:10px;
-    text-decoration:none;
-    color:white !important;
-    font-weight:600;
-    font-size:15px;
-    padding:12px 18px;
-    border-radius:10px;
-    width:100%;
-    box-sizing:border-box;
-    margin-bottom:8px;
-    transition:opacity 0.15s ease-in-out;
-}
-.share-btn:hover {opacity:0.88;}
-.share-btn .logo-circle {
-    background:white;
-    border-radius:50%;
-    width:26px;
-    height:26px;
-    display:flex;
-    align-items:center;
-    justify-content:center;
-    font-size:15px;
-    flex-shrink:0;
-}
-.whatsapp-btn {background:#25D366;}
-.whatsapp-btn .logo-circle {color:#25D366;}
-.gmail-btn {background:#EA4335;}
-.gmail-btn .logo-circle {color:#EA4335;}
-.mailapp-btn {background:#4A5568;}
-.mailapp-btn .logo-circle {color:#4A5568;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -89,45 +45,6 @@ else:
     st.sidebar.info("Give API key")
     st.sidebar.markdown("Get key from https://aistudio.google.com/app/apikey")
 
-if not OCR_AVAILABLE:
-    st.sidebar.warning(
-        "OCR libraries not found (pillow / pytesseract not installed via pip). "
-        "Run: pip install pillow pytesseract"
-    )
-else:
-    with st.sidebar.expander("🔧 OCR (Tesseract) setup"):
-        st.caption(
-            "pytesseract is just a Python wrapper - it calls the separate "
-            "Tesseract OCR program. If that program isn't installed, or isn't "
-            "on your system PATH, OCR will fail even though pytesseract "
-            "imported fine."
-        )
-        manual_path = st.text_input(
-            "Tesseract executable path (only needed if auto-detect fails)",
-            value=st.session_state.get("tesseract_cmd_path", ""),
-            placeholder=r"e.g. C:\Program Files\Tesseract-OCR\tesseract.exe",
-            key="tesseract_cmd_path",
-        )
-        if manual_path:
-            pytesseract.pytesseract.tesseract_cmd = manual_path
-
-        if st.button("Test OCR setup"):
-            try:
-                version = pytesseract.get_tesseract_version()
-                st.success(f"Tesseract found - version {version}")
-            except Exception as e:
-                st.error(
-                    "Tesseract engine not found. This means the Python package "
-                    "is installed, but the actual OCR program isn't. Install it:\n\n"
-                    "- Windows: download from "
-                    "https://github.com/UB-Mannheim/tesseract/wiki, then paste "
-                    "the full path to tesseract.exe above (commonly "
-                    r"C:\Program Files\Tesseract-OCR\tesseract.exe)"
-                    "\n- Mac: `brew install tesseract`\n"
-                    "- Linux: `sudo apt-get install tesseract-ocr`\n\n"
-                    f"Raw error: {e}"
-                )
-
 
 # small helper so we don't repeat the same ChatGoogleGenerativeAI setup everywhere
 def get_gemini_model():
@@ -144,7 +61,7 @@ def load_expenses():
         df = pd.read_csv(DATA_FILE)
         if list(df.columns) != cols:
             df = pd.DataFrame(columns=cols)
-    except Exception:
+    except:
         df = pd.DataFrame(columns=cols)
     df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce").fillna(0.0)
     return df
@@ -154,11 +71,60 @@ def save_expenses(df):
     df.to_csv(DATA_FILE, index=False)
 
 
-def add_expense_row(category, remark, amount):
-    new_row = pd.DataFrame([{"Category": category, "Remark": remark, "Amount": amount}])
-    st.session_state.expenses = pd.concat([st.session_state.expenses, new_row], ignore_index=True)
-    st.session_state.expenses["Amount"] = pd.to_numeric(st.session_state.expenses["Amount"], errors="coerce").fillna(0.0)
-    save_expenses(st.session_state.expenses)
+# ---------------- OCR BILL SCAN (Gemini Vision) ----------------
+# Sends the uploaded/captured bill image straight to Gemini (multimodal) and asks
+# it to return structured JSON line items. No separate OCR engine needed since
+# Gemini can read the image directly.
+def extract_expenses_from_bill(image_bytes, mime_type):
+    model = get_gemini_model()
+    b64_img = base64.b64encode(image_bytes).decode("utf-8")
+
+    instructions = (
+        "You are reading a photo of a shopping receipt / bill / invoice. "
+        "Extract each distinct expense line you can clearly identify. "
+        "Respond with ONLY valid JSON (no markdown fences, no explanation text), "
+        "as a JSON array like this exact shape:\n"
+        '[{"category": "Food", "remark": "short item or store name", "amount": 123.45}]\n'
+        "Rules:\n"
+        f"- category MUST be exactly one of: {', '.join(CATEGORY_OPTIONS)}\n"
+        "- amount must be a plain number (no currency symbols, no commas)\n"
+        "- if you can only make out one grand total (not itemised), return a single "
+        "object using the store/vendor name as remark and the total as amount\n"
+        "- if the image is unreadable or not a bill, return an empty array []"
+    )
+
+    message = HumanMessage(
+        content=[
+            {"type": "text", "text": instructions},
+            {"type": "image_url", "image_url": f"data:{mime_type};base64,{b64_img}"},
+        ]
+    )
+
+    response = model.invoke([message])
+    raw_text = response.content.strip()
+
+    # gemini sometimes wraps json in ```json ... ``` even when told not to, strip that off
+    if raw_text.startswith("```"):
+        raw_text = raw_text.strip("`")
+        raw_text = raw_text.replace("json", "", 1).strip()
+
+    items = json.loads(raw_text)
+
+    # basic cleanup / validation so bad rows dont break the app
+    cleaned = []
+    for item in items:
+        cat = item.get("category", "Other")
+        if cat not in CATEGORY_OPTIONS:
+            cat = "Other"
+        try:
+            amt = float(item.get("amount", 0))
+        except (TypeError, ValueError):
+            amt = 0.0
+        remark = str(item.get("remark", "")).strip()
+        if amt > 0:
+            cleaned.append({"Category": cat, "Remark": remark, "Amount": amt})
+
+    return cleaned
 
 
 if "expenses" not in st.session_state:
@@ -170,16 +136,16 @@ if "chat_history" not in st.session_state:
 if "budgets" not in st.session_state:
     st.session_state.budgets = {}
 
-if "income_val" not in st.session_state:
-    st.session_state.income_val = 0.0
+if "scanned_items" not in st.session_state:
+    st.session_state.scanned_items = pd.DataFrame(columns=cols)
 
 # ---------------- INCOME ----------------
 st.subheader("1. Monthly Income")
-income = st.number_input("Enter Monthly Income (₹)", min_value=0.0, step=500.0, key="income_val")
+income = st.number_input("Enter Monthly Income (₹)", min_value=0.0, step=500.0)
 
 # using tabs so everything doesnt look like one giant scrolling page
-tab_add, tab_import, tab_dash, tab_forecast, tab_advisor, tab_chat, tab_share = st.tabs(
-    ["Add Expense", "Scan / Import", "Dashboard", "Forecast", "AI Advisor", "Chat", "Share/Export"]
+tab_add, tab_dash, tab_forecast, tab_advisor, tab_chat, tab_share = st.tabs(
+    ["Add Expense", "Dashboard", "Forecast", "AI Advisor", "Chat", "Share/Export"]
 )
 
 # =========================================================
@@ -191,7 +157,7 @@ with tab_add:
     c1, c2, c3, c4 = st.columns(4)
 
     with c1:
-        category = st.selectbox("Category", ["Food", "Rent", "Transport", "Shopping", "Entertainment", "Utilities", "Other"])
+        category = st.selectbox("Category", CATEGORY_OPTIONS)
         custom_cat = ""
         if category == "Other":
             custom_cat = st.text_input("Custom Category Name")
@@ -209,10 +175,73 @@ with tab_add:
         final_cat = custom_cat.strip() if category == "Other" and custom_cat.strip() != "" else category
 
         if amount > 0:
-            add_expense_row(final_cat, remark, amount)
+            new_row = pd.DataFrame([{"Category": final_cat, "Remark": remark, "Amount": amount}])
+            st.session_state.expenses = pd.concat([st.session_state.expenses, new_row], ignore_index=True)
+            st.session_state.expenses["Amount"] = pd.to_numeric(st.session_state.expenses["Amount"], errors="coerce").fillna(0.0)
+            save_expenses(st.session_state.expenses)
             st.success("Added " + final_cat + " : ₹" + str(amount))
         else:
             st.warning("amount should be more than 0")
+
+    st.write("---")
+    st.subheader("📷 Scan a Bill / Receipt (auto add expenses)")
+    st.caption("upload a photo or take a picture of your bill, AI will read it and fill in the expenses for you")
+
+    if not GEMINI_API_KEY:
+        st.info("give api key in sidebar first to use bill scanning")
+    else:
+        scan_c1, scan_c2 = st.columns(2)
+        with scan_c1:
+            uploaded_bill = st.file_uploader("Upload bill image", type=["jpg", "jpeg", "png", "webp"], key="bill_upload")
+        with scan_c2:
+            camera_bill = st.camera_input("Or take a photo")
+
+        bill_file = camera_bill if camera_bill is not None else uploaded_bill
+
+        if bill_file is not None:
+            st.image(bill_file, caption="Bill preview", width=250)
+
+            if st.button("🔍 Scan Bill with AI"):
+                with st.spinner("reading your bill.."):
+                    try:
+                        img_bytes = bill_file.getvalue()
+                        mime = bill_file.type if getattr(bill_file, "type", None) else "image/jpeg"
+                        extracted = extract_expenses_from_bill(img_bytes, mime)
+
+                        if not extracted:
+                            st.warning("couldn't read any expense lines from this image, try a clearer photo")
+                        else:
+                            st.session_state.scanned_items = pd.DataFrame(extracted)
+                            st.success(f"found {len(extracted)} item(s), review below before adding")
+                    except json.JSONDecodeError:
+                        st.error("AI didn't return clean data, try scanning again or use a clearer photo")
+                    except Exception as e:
+                        st.error("Error: " + str(e))
+
+        # review + confirm scanned items before they go into the real expense table
+        if not st.session_state.scanned_items.empty:
+            st.write("Review scanned items (edit if needed):")
+            reviewed = st.data_editor(
+                st.session_state.scanned_items,
+                use_container_width=True,
+                num_rows="dynamic",
+                key="scanned_editor",
+            )
+
+            rc1, rc2 = st.columns(2)
+            with rc1:
+                if st.button("✅ Add Scanned Items to Expenses"):
+                    reviewed["Amount"] = pd.to_numeric(reviewed["Amount"], errors="coerce").fillna(0.0)
+                    reviewed = reviewed[reviewed["Amount"] > 0]
+                    st.session_state.expenses = pd.concat([st.session_state.expenses, reviewed], ignore_index=True)
+                    save_expenses(st.session_state.expenses)
+                    st.session_state.scanned_items = pd.DataFrame(columns=cols)
+                    st.success("added scanned items to your expenses!")
+                    st.rerun()
+            with rc2:
+                if st.button("❌ Discard Scanned Items"):
+                    st.session_state.scanned_items = pd.DataFrame(columns=cols)
+                    st.rerun()
 
     st.write("---")
     st.subheader("Expense Table")
@@ -248,247 +277,7 @@ with tab_add:
             st.session_state.budgets[cat] = st.number_input(cat + " Limit", min_value=0.0, step=500.0, key="lim_" + cat)
 
 # =========================================================
-# TAB 2 - SCAN / IMPORT (OCR receipts + bank statement)
-# =========================================================
-with tab_import:
-
-    # ---- keyword based auto categorizer, used for both OCR and bank rows ----
-    CATEGORY_KEYWORDS = {
-        "Food": ["restaurant", "food", "swiggy", "zomato", "cafe", "dine", "kitchen",
-                  "hotel", "dominos", "pizza", "bakery"],
-        "Rent": ["rent", "landlord", "housing society", "maintenance"],
-        "Transport": ["uber", "ola", "fuel", "petrol", "diesel", "metro", "taxi",
-                       "irctc", "flight", "indigo", "rapido", "train", "toll"],
-        "Shopping": ["amazon", "flipkart", "mall", "store", "myntra", "shop", "mart"],
-        "Entertainment": ["netflix", "spotify", "movie", "cinema", "bookmyshow",
-                            "prime video", "hotstar", "pvr"],
-        "Utilities": ["electricity", "water bill", "recharge", "broadband", "wifi",
-                       "gas bill", "dth", "airtel", "jio", "vodafone"],
-    }
-
-    def categorize_from_text(text):
-        text_l = (text or "").lower()
-        for cat, kws in CATEGORY_KEYWORDS.items():
-            if any(kw in text_l for kw in kws):
-                return cat
-        return "Other"
-
-    st.subheader("📷 Scan a Bill / Receipt (OCR)")
-    st.caption("upload a photo of a receipt and it'll try to read the merchant + total amount off it")
-
-    if not OCR_AVAILABLE:
-        st.error(
-            "OCR isn't available in this environment. Install the Python packages "
-            "`pytesseract` and `pillow`, AND install the Tesseract OCR engine itself "
-            "(it's a separate system binary, not just a pip package):\n\n"
-            "- Ubuntu/Debian: `sudo apt-get install tesseract-ocr`\n"
-            "- Mac: `brew install tesseract`\n"
-            "- Windows: install from https://github.com/UB-Mannheim/tesseract/wiki"
-        )
-    else:
-        receipt_img = st.file_uploader("Upload receipt image", type=["png", "jpg", "jpeg"], key="receipt_uploader")
-
-        if receipt_img is not None:
-            img = Image.open(receipt_img)
-            col_img, col_data = st.columns([1, 1.4])
-
-            with col_img:
-                st.image(img, caption="Uploaded receipt", use_container_width=True)
-
-            with st.spinner("reading receipt..."):
-                try:
-                    ocr_text = pytesseract.image_to_string(img)
-                except pytesseract.TesseractNotFoundError:
-                    ocr_text = ""
-                    st.error(
-                        "Tesseract engine isn't installed / found on this machine. "
-                        "Open '🔧 OCR (Tesseract) setup' in the sidebar to install it "
-                        "or point to the executable manually, then re-upload the image."
-                    )
-                except Exception as e:
-                    ocr_text = ""
-                    st.error("OCR failed: " + repr(e))
-
-            # try to guess the total amount - look for a "total" line first,
-            # fall back to the largest rupee-looking number on the receipt
-            def guess_amount(text):
-                text_l = text.lower()
-                patterns = [
-                    r'(?:grand\s*total|total\s*amount|net\s*amount|amount\s*payable|total)[:\s₹rs\.]*([\d,]+\.\d{1,2})',
-                    r'(?:grand\s*total|total\s*amount|net\s*amount|amount\s*payable|total)[:\s₹rs\.]*([\d,]+)',
-                ]
-                for pat in patterns:
-                    m = re.search(pat, text_l)
-                    if m:
-                        try:
-                            return float(m.group(1).replace(",", ""))
-                        except ValueError:
-                            pass
-                nums = re.findall(r'[\d,]+\.\d{2}', text)
-                nums = [float(n.replace(",", "")) for n in nums]
-                if nums:
-                    return max(nums)
-                whole_nums = re.findall(r'\b\d{2,6}\b', text)
-                whole_nums = [float(n) for n in whole_nums]
-                return max(whole_nums) if whole_nums else 0.0
-
-            def guess_merchant(text):
-                lines = [l.strip() for l in text.splitlines() if l.strip()]
-                return lines[0] if lines else "Receipt"
-
-            guessed_amount = guess_amount(ocr_text)
-            guessed_merchant = guess_merchant(ocr_text)
-            guessed_cat = categorize_from_text(ocr_text)
-
-            with col_data:
-                with st.expander("Raw OCR text (click to check if something looks off)"):
-                    st.text(ocr_text if ocr_text.strip() else "(couldn't read any text from this image)")
-
-                st.write("Review and fix the details below before adding:")
-                r_cat = st.selectbox(
-                    "Category",
-                    ["Food", "Rent", "Transport", "Shopping", "Entertainment", "Utilities", "Other"],
-                    index=["Food", "Rent", "Transport", "Shopping", "Entertainment", "Utilities", "Other"].index(guessed_cat) if guessed_cat in ["Food", "Rent", "Transport", "Shopping", "Entertainment", "Utilities"] else 6,
-                    key="ocr_cat"
-                )
-                r_remark = st.text_input("Remark / Merchant", value=guessed_merchant, key="ocr_remark")
-                r_amount = st.number_input("Amount (₹)", min_value=0.0, step=10.0, value=float(guessed_amount), key="ocr_amount")
-
-                if st.button("➕ Add this receipt as an expense"):
-                    if r_amount > 0:
-                        add_expense_row(r_cat, r_remark, r_amount)
-                        st.toast(f"Added {r_cat} : ₹{r_amount} from receipt", icon="✅")
-                        st.rerun()
-                    else:
-                        st.warning("amount should be more than 0")
-
-    st.write("---")
-    st.subheader("🏦 Import from Bank Statement")
-    st.caption("upload a CSV/Excel export of your bank statement, map the columns, and bulk-add transactions")
-
-    bank_file = st.file_uploader("Upload bank statement (CSV or Excel)", type=["csv", "xlsx", "xls"], key="bank_uploader")
-
-    if bank_file is not None:
-        skip_rows = st.number_input(
-            "Rows to skip before the header (increase this if the preview below looks wrong / empty - "
-            "most bank exports have a few info rows like account number, statement period, etc. "
-            "before the real column headers)",
-            min_value=0, max_value=50, value=0, step=1, key="bank_skip_rows"
-        )
-
-        bank_df = None
-        try:
-            if bank_file.name.lower().endswith(".csv"):
-                bank_df = pd.read_csv(bank_file, skiprows=skip_rows)
-            else:
-                bank_df = pd.read_excel(bank_file, skiprows=skip_rows)
-        except Exception as e:
-            st.error("couldn't read that file:")
-            st.exception(e)
-
-        if bank_df is not None:
-            # drop fully-empty rows/cols, which bank exports love to include
-            bank_df = bank_df.dropna(axis=0, how="all").dropna(axis=1, how="all")
-
-        if bank_df is None:
-            pass
-        elif bank_df.empty:
-            st.warning(
-                f"The file read fine but produced an empty table (0 usable rows) with "
-                f"{skip_rows} row(s) skipped. Try increasing 'Rows to skip before the header' above, "
-                "or open the file and check where the real transaction table starts."
-            )
-        else:
-            st.write(f"Parsed {len(bank_df)} row(s). Preview:")
-            st.dataframe(bank_df.head(), use_container_width=True)
-
-            all_cols = list(bank_df.columns)
-            st.write("Map your columns:")
-            mc1, mc2, mc3, mc4 = st.columns(4)
-            with mc1:
-                desc_col = st.selectbox("Description column", all_cols, key="bank_desc_col")
-            with mc2:
-                amount_mode = st.radio("Amount format", ["Single Amount column (+/-)", "Separate Debit/Credit columns"], key="bank_amt_mode")
-            with mc3:
-                if amount_mode == "Single Amount column (+/-)":
-                    amt_col = st.selectbox("Amount column", all_cols, key="bank_amt_col")
-                    debit_col = credit_col = None
-                else:
-                    debit_col = st.selectbox("Debit column", all_cols, key="bank_debit_col")
-                    amt_col = None
-            with mc4:
-                if amount_mode != "Single Amount column (+/-)":
-                    credit_col = st.selectbox("Credit column", all_cols, key="bank_credit_col")
-
-            try:
-                # build a normalized transactions table: Description, Amount, Type (Debit/Credit)
-                work = bank_df.copy()
-                if amount_mode == "Single Amount column (+/-)":
-                    work["_amount_raw"] = pd.to_numeric(
-                        work[amt_col].astype(str).str.replace(",", "", regex=False).str.replace("₹", "", regex=False).str.strip(),
-                        errors="coerce"
-                    ).fillna(0.0)
-                    work["_type"] = work["_amount_raw"].apply(lambda x: "Credit" if x > 0 else "Debit")
-                    work["_amount"] = work["_amount_raw"].abs()
-                else:
-                    debit_vals = pd.to_numeric(
-                        work[debit_col].astype(str).str.replace(",", "", regex=False).str.replace("₹", "", regex=False).str.strip(),
-                        errors="coerce"
-                    ).fillna(0.0)
-                    credit_vals = pd.to_numeric(
-                        work[credit_col].astype(str).str.replace(",", "", regex=False).str.replace("₹", "", regex=False).str.strip(),
-                        errors="coerce"
-                    ).fillna(0.0)
-                    work["_amount"] = debit_vals.where(debit_vals > 0, credit_vals)
-                    work["_type"] = debit_vals.apply(lambda x: "Debit" if x > 0 else "Credit")
-
-                work["_desc"] = work[desc_col].astype(str)
-                work["_category"] = work["_desc"].apply(categorize_from_text)
-                work.loc[work["_type"] == "Credit", "_category"] = "Income"
-
-                preview = work[["_desc", "_type", "_category", "_amount"]].rename(
-                    columns={"_desc": "Description", "_type": "Type", "_category": "Category", "_amount": "Amount"}
-                )
-                # rows where the amount column was blank/non-numeric everywhere would show as 0 - filter those out
-                preview = preview[preview["Amount"] > 0].reset_index(drop=True)
-            except Exception as e:
-                preview = None
-                st.error("couldn't build the transaction table from the columns you picked:")
-                st.exception(e)
-
-            if preview is not None and preview.empty:
-                st.warning(
-                    "No non-zero transactions found with the columns you selected. "
-                    "Double check you picked the right Amount/Debit/Credit column - "
-                    "it should contain numbers, not text."
-                )
-            elif preview is not None:
-                st.write("Transactions found (edit categories if needed, then import):")
-                preview_edited = st.data_editor(preview, use_container_width=True, key="bank_preview_editor")
-
-                total_debit = preview_edited.loc[preview_edited["Type"] == "Debit", "Amount"].sum()
-                total_credit = preview_edited.loc[preview_edited["Type"] == "Credit", "Amount"].sum()
-
-                st.write(f"Total spending found: **₹{total_debit:,.2f}**  |  Total income found: **₹{total_credit:,.2f}**")
-
-                bi1, bi2 = st.columns(2)
-                with bi1:
-                    if st.button("➕ Add all Debit rows as Expenses"):
-                        debit_rows = preview_edited[preview_edited["Type"] == "Debit"]
-                        added = 0
-                        for _, row in debit_rows.iterrows():
-                            if row["Amount"] > 0:
-                                add_expense_row(row["Category"], row["Description"], row["Amount"])
-                                added += 1
-                        st.toast(f"Added {added} expense(s) from bank statement", icon="✅")
-                        st.rerun()
-                with bi2:
-                    if st.button(f"💰 Set Monthly Income to detected credit total (₹{total_credit:,.2f})"):
-                        st.session_state.income_val = float(total_credit)
-                        st.rerun()
-
-# =========================================================
-# TAB 3 - DASHBOARD
+# TAB 2 - DASHBOARD
 # =========================================================
 with tab_dash:
     total_exp = st.session_state.expenses["Amount"].sum() if not st.session_state.expenses.empty else 0.0
@@ -559,7 +348,7 @@ with tab_dash:
         st.info("enter income to see tips")
 
 # =========================================================
-# TAB 4 - FORECAST
+# TAB 3 - FORECAST
 # =========================================================
 with tab_forecast:
     total_exp = st.session_state.expenses["Amount"].sum() if not st.session_state.expenses.empty else 0.0
@@ -593,7 +382,7 @@ with tab_forecast:
         st.info("enter income and add expenses first")
 
 # =========================================================
-# TAB 5 - AI ADVISOR
+# TAB 4 - AI ADVISOR
 # =========================================================
 with tab_advisor:
     total_exp = st.session_state.expenses["Amount"].sum() if not st.session_state.expenses.empty else 0.0
@@ -634,7 +423,7 @@ with tab_advisor:
     st.warning("⚠️ Disclaimer: Yeh AI advice sirf general guidance ke liye hai. Kripya koi bhi bada financial decision lene se pehle ek certified financial adviser se consult karo.")
 
 # =========================================================
-# TAB 6 - CHAT
+# TAB 5 - CHAT
 # =========================================================
 with tab_chat:
     total_exp = st.session_state.expenses["Amount"].sum() if not st.session_state.expenses.empty else 0.0
@@ -682,12 +471,11 @@ with tab_chat:
             st.write(ans)
 
 # =========================================================
-# TAB 7 - SHARE / EXPORT
+# TAB 6 - SHARE / EXPORT
 # =========================================================
 with tab_share:
     total_exp = st.session_state.expenses["Amount"].sum() if not st.session_state.expenses.empty else 0.0
     balance = income - total_exp
-    cat_totals = st.session_state.expenses.groupby("Category")["Amount"].sum() if not st.session_state.expenses.empty else pd.Series(dtype=float)
 
     st.subheader("Export Data")
     if not st.session_state.expenses.empty:
@@ -699,107 +487,30 @@ with tab_share:
     st.write("---")
     st.subheader("Share Report")
 
-    # ---------- nicely formatted markdown report, shown as a live preview ----------
-    def build_markdown_report(income, total_exp, balance, cat_totals):
-        lines = []
-        lines.append("# 📊 AI Personal Budget Planner")
-        lines.append("## Monthly Budget Report")
-        lines.append("")
-        lines.append("**Report Summary**")
-        lines.append("")
-        lines.append("| Metric | Amount |")
-        lines.append("|---|---:|")
-        lines.append(f"| 💰 Monthly Income | **Rs. {income:,.2f}** |")
-        lines.append(f"| 💸 Total Expenses | **Rs. {total_exp:,.2f}** |")
-        bal_icon = "📉" if balance < 0 else "📈"
-        lines.append(f"| {bal_icon} Remaining Balance | **Rs. {balance:,.2f}** |")
-        lines.append("---")
-        lines.append("## Expense Breakdown")
-        lines.append("")
-        if not cat_totals.empty:
-            lines.append("| Category | Amount (Rs.) |")
-            lines.append("|---|---:|")
-            for cat, amt in cat_totals.items():
-                lines.append(f"| {cat} | {amt:,.2f} |")
-        else:
-            lines.append("_No expenses recorded yet._")
-        lines.append("---")
-        lines.append("## Financial Insights")
-        lines.append("")
-        if balance < 0:
-            lines.append(f"⚠️ Your expenses exceeded your income this month, resulting in a **negative balance of Rs. {abs(balance):,.2f}**.")
-        elif income > 0:
-            lines.append(f"✅ You're within budget this month with a **positive balance of Rs. {balance:,.2f}**.")
-        else:
-            lines.append("ℹ️ No income recorded yet, so balance can't be fully evaluated.")
-        lines.append("")
-        lines.append("### Recommendations")
-        recs = []
-        if not cat_totals.empty:
-            top_cat = cat_totals.idxmax()
-            top_amt = cat_totals.max()
-            recs.append(f"Review high-value expenses such as **{top_cat} (Rs. {top_amt:,.2f})**.")
-        recs.append("Set a monthly budget limit for discretionary spending.")
-        recs.append("Track expenses regularly to avoid overspending.")
-        recs.append("Consider building an emergency savings fund.")
-        if income == 0:
-            recs.append("Record your monthly income to receive more accurate financial insights.")
-        for r in recs:
-            lines.append(f"* {r}")
-        lines.append("---")
-        lines.append("*This report was automatically generated by the **AI Personal Budget Planner**.*")
-        return "\n".join(lines)
+    # builds the text report we send over email/whatsapp
+    exp_summary = st.session_state.expenses.groupby("Category")["Amount"].sum().to_string() if not st.session_state.expenses.empty else "No expenses recorded"
+    report_text = f"""AI Personal Budget Planner Report
 
-    # ---------- plain-text version for WhatsApp / email body ----------
-    # (WhatsApp & most mail clients don't render markdown tables, so this uses
-    # simple bullet lines + WhatsApp-style *bold*/_italic_ markers instead)
-    def build_plain_report(income, total_exp, balance, cat_totals):
-        lines = []
-        lines.append("📊 *AI PERSONAL BUDGET PLANNER*")
-        lines.append("_Monthly Budget Report_")
-        lines.append("")
-        lines.append("*Summary*")
-        lines.append(f"💰 Income: Rs. {income:,.2f}")
-        lines.append(f"💸 Expenses: Rs. {total_exp:,.2f}")
-        bal_icon = "📉" if balance < 0 else "📈"
-        lines.append(f"{bal_icon} Balance: Rs. {balance:,.2f}")
-        lines.append("")
-        lines.append("*Expense Breakdown*")
-        if not cat_totals.empty:
-            for cat, amt in cat_totals.items():
-                lines.append(f"• {cat}: Rs. {amt:,.2f}")
-        else:
-            lines.append("No expenses recorded yet.")
-        lines.append("")
-        lines.append("*Insights*")
-        if balance < 0:
-            lines.append(f"⚠️ Overspent by Rs. {abs(balance):,.2f} this month.")
-        elif income > 0:
-            lines.append(f"✅ Saved Rs. {balance:,.2f} this month.")
-        else:
-            lines.append("ℹ️ Add your income for a full picture.")
-        if not cat_totals.empty:
-            lines.append(f"👉 Biggest expense: {cat_totals.idxmax()} (Rs. {cat_totals.max():,.2f})")
-        lines.append("")
-        lines.append("_Generated by AI Personal Budget Planner_")
-        return "\n".join(lines)
+Monthly Income: Rs.{income:,.2f}
+Total Expense: Rs.{total_exp:,.2f}
+Balance: Rs.{balance:,.2f}
 
-    markdown_report = build_markdown_report(income, total_exp, balance, cat_totals)
-    plain_report = build_plain_report(income, total_exp, balance, cat_totals)
+Expense Breakdown:
+{exp_summary}
 
-    with st.expander("📄 Preview report", expanded=True):
-        st.markdown(markdown_report)
+- generated by AI Personal Budget Planner"""
 
-    st.write("")
     colA, colB = st.columns(2)
 
     with colA:
-        st.write("**Send via Email**")
+        st.write("Send via Email")
         to_email = st.text_input("Recipient Email")
 
+        # just building the mail as a template here, not sending it ourself
+        # this opens gmail in browser (already logged in) or default mail app
         subject = "Your Monthly Budget Report"
         mail_subject = urllib.parse.quote(subject)
-        mail_body = urllib.parse.quote(plain_report)
+        mail_body = urllib.parse.quote(report_text)
 
         if st.button("Prepare Mail"):
             if not to_email:
@@ -810,27 +521,16 @@ with tab_share:
                 mailto_url = f"mailto:{to_email}?subject={mail_subject}&body={mail_body}"
 
                 st.success("mail template ready, click below to send")
-                st.markdown(f"""
-                <a class="share-btn gmail-btn" href="{gmail_url}" target="_blank">
-                    <span class="logo-circle">✉️</span> Open in Gmail (web)
-                </a>
-                <a class="share-btn mailapp-btn" href="{mailto_url}">
-                    <span class="logo-circle">📧</span> Open in Mail App
-                </a>
-                """, unsafe_allow_html=True)
+                st.link_button("Open in Gmail (web)", gmail_url)
+                st.link_button("Open in Mail App", mailto_url)
                 st.caption("this just opens the mail already filled in, using your own logged in gmail / mail app. we dont touch your password.")
 
     with colB:
-        st.write("**Send via WhatsApp**")
-        wa_text = urllib.parse.quote(plain_report)
+        st.write("Send via WhatsApp")
+        wa_text = urllib.parse.quote(report_text)
         wa_url = "https://wa.me/?text=" + wa_text
-        st.markdown(f"""
-        <a class="share-btn whatsapp-btn" href="{wa_url}" target="_blank">
-            <span class="logo-circle">💬</span> Share on WhatsApp
-        </a>
-        """, unsafe_allow_html=True)
+        st.link_button("Share on WhatsApp", wa_url)
         st.caption("opens whatsapp, pick a contact and send")
 
 # TODO: maybe add monthly comparison graph later
 # TODO: pdf export instead of just csv
-# TODO: PDF bank statement parsing (currently CSV/Excel only)
