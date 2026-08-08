@@ -357,7 +357,8 @@ with tab_import:
                 if st.button("➕ Add this receipt as an expense"):
                     if r_amount > 0:
                         add_expense_row(r_cat, r_remark, r_amount)
-                        st.success(f"Added {r_cat} : ₹{r_amount} from receipt")
+                        st.toast(f"Added {r_cat} : ₹{r_amount} from receipt", icon="✅")
+                        st.rerun()
                     else:
                         st.warning("amount should be more than 0")
 
@@ -479,7 +480,8 @@ with tab_import:
                             if row["Amount"] > 0:
                                 add_expense_row(row["Category"], row["Description"], row["Amount"])
                                 added += 1
-                        st.success(f"Added {added} expense(s) from bank statement")
+                        st.toast(f"Added {added} expense(s) from bank statement", icon="✅")
+                        st.rerun()
                 with bi2:
                     if st.button(f"💰 Set Monthly Income to detected credit total (₹{total_credit:,.2f})"):
                         st.session_state.income_val = float(total_credit)
